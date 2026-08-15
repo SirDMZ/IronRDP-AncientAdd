@@ -1455,6 +1455,13 @@ fn create_gcc_blocks<'a>(
                         | ClientEarlyCapabilityFlags::SUPPORT_ERR_INFO_PDU
                         | ClientEarlyCapabilityFlags::STRONG_ASYMMETRIC_KEYS
                         | ClientEarlyCapabilityFlags::SUPPORT_NET_CHAR_AUTODETECT
+                        // Announce participation in the monitor-layout / dynamic-display
+                        // feature. A Windows RDS host opens the DisplayControl DVC
+                        // (MS-RDPEDISP) — which the client registers — only for a client
+                        // that advertises this flag. The server may then send a Monitor
+                        // Layout PDU during finalization, handled in
+                        // connection_finalization.rs.
+                        | ClientEarlyCapabilityFlags::SUPPORT_MONITOR_LAYOUT_PDU
                         | ClientEarlyCapabilityFlags::SUPPORT_SKIP_CHANNELJOIN;
 
                     // TODO(#136): support for ClientEarlyCapabilityFlags::SUPPORT_STATUS_INFO_PDU
