@@ -6,6 +6,31 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [Unreleased]
+
+### Added
+
+- Runtime-selectable RemoteFX Progressive `TILE_UPGRADE` decode variant, via
+  `progressive::set_upgrade_variant` (default `1`, previous behavior unchanged):
+  - `1` — baseline per-band decode, matching the current base-quantization pipeline.
+  - `2` — a single SRL reader (`kp = 8`, truncated-unary) threaded across all ten DWT
+    subbands. Insurance for a server where the baseline's per-band SRL restart would
+    corrupt refinements after the first refined subband.
+
+### Removed
+
+- A third, `base_q`-coupled upgrade-decode variant (refine shift
+  `(base_q - 1) + bit_pos`, LL3 read entirely from the raw stream, accumulate onto the
+  existing coefficient). It was faithful to a decoder built against a **pre-0.9.0**
+  release of this crate, whose `dequantize_component_ccq` shifted coefficients by
+  `(q - 1)`. Base dequantization has since moved to a 6-pivot convention (`q - 6` when
+  `q > 6`; a rounded right shift when `q < 6`), so this variant's refinements landed
+  roughly five bit-planes too high and saturated — it rendered no usable image on the
+  current pipeline, while variants 1 and 2 (which never reference `base_q`) decode
+  correctly. Making it work would mean reverting the entire base-quant pipeline, so it
+  was dropped rather than shipped as a broken option.
+
+
 ## [[0.9.0](https://github.com/Devolutions/IronRDP/compare/ironrdp-graphics-v0.8.1...ironrdp-graphics-v0.9.0)] - 2026-07-10
 
 ### <!-- 4 -->Bug Fixes

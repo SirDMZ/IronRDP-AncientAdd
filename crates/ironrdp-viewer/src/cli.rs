@@ -86,9 +86,8 @@ struct Args {
     gw_rpc: bool,
 
     /// Progressive (RemoteFX) TILE_UPGRADE decode variant, for A/B testing image
-    /// quality against a server: 1 = baseline, 2 = threaded SRL reader, 3 = full
-    /// FreeRDP-faithful refinement.
-    #[clap(long = "graphics-upgrade", value_parser = clap::value_parser!(u8).range(1..=3), default_value_t = 1)]
+    /// quality against a server: 1 = baseline (default), 2 = threaded SRL reader.
+    #[clap(long = "graphics-upgrade", value_parser = clap::value_parser!(u8).range(1..=2), default_value_t = 1)]
     graphics_upgrade: u8,
 
     /// An address on which the client will connect.

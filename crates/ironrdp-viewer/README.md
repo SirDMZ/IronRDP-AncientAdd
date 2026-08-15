@@ -95,25 +95,22 @@ See [`tracing-subscriber`'s documentation][tracing-doc] for more details.
 
 ## Progressive graphics decode variants
 
-RemoteFX Progressive `TILE_UPGRADE` (refinement) passes can be decoded three ways,
-selected at runtime with `--graphics-upgrade <1|2|3>` (default `1`). It is a runtime
+RemoteFX Progressive `TILE_UPGRADE` (refinement) passes can be decoded two ways,
+selected at runtime with `--graphics-upgrade <1|2>` (default `1`). It is a runtime
 switch — no rebuild — so a live session can be A/B-compared against a given server:
 
 - `1` — **baseline**: the upstream `ironrdp-graphics` decoder (a fresh per-band SRL
-  reader, shift by the current bit-plane). Correct on every server tested so far, and
-  the default.
+  reader, shift by the current bit-plane). Matches the current upstream base-quant
+  pipeline and renders correctly on every server tested so far; the default.
 - `2` — **threaded SRL**: one continuous SRL reader across all ten DWT subbands
-  (`kp=8`, truncated-unary), with the baseline refinement math otherwise.
-- `3` — **FreeRDP-faithful**: variant 2 plus the coupled refinement math — refine
-  shift `(base_q - 1) + bit_pos`, LL3 read wholly from the raw stream, and
-  accumulation onto the existing coefficient instead of overwrite.
+  (`kp=8`, truncated-unary), with the baseline refinement math otherwise. Insurance
+  for a server where the per-band SRL restart would corrupt refinements after the
+  first refined subband (smeared / washed-out / blocky large areas).
 
-Variants 2 and 3 exist for servers whose progressive refinement renders large image
-areas smeared, washed-out, or blocky (a symptom of the baseline restarting the SRL
-stream at each subband). If a full-desktop update shows that, step the flag up until
-the image is clean. The underlying selector is
-`ironrdp_graphics::progressive::set_upgrade_variant`, so other front-ends can expose
-the same choice.
+The underlying selector is `ironrdp_graphics::progressive::set_upgrade_variant`, so
+other front-ends can expose the same choice. (A third `base_q`-coupled variant was
+tried and removed — it assumed a pre-0.9.0 base-quantization convention and is
+incompatible with the current pipeline; see the `ironrdp-graphics` CHANGELOG.)
 
 ## Support for `SSLKEYLOGFILE`
 
