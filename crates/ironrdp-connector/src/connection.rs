@@ -1501,7 +1501,19 @@ fn create_gcc_blocks<'a>(
         },
         // TODO(#139): support for Some(ClientClusterData { flags: RedirectionFlags::REDIRECTION_SUPPORTED, redirection_version: RedirectionVersion::V4, redirected_session_id: 0, }),
         cluster: None,
-        monitor: None,
+        // Advertise a single primary monitor covering the desktop. mstsc/FreeRDP send
+        // a monitor layout; a Windows RDS host can otherwise lack the display geometry
+        // it needs. The monitor's bounding box matches `desktop_size` (right/bottom are
+        // inclusive, hence the -1).
+        monitor: Some(gcc::ClientMonitorData {
+            monitors: vec![gcc::Monitor {
+                left: 0,
+                top: 0,
+                right: i32::from(config.desktop_size.width).saturating_sub(1),
+                bottom: i32::from(config.desktop_size.height).saturating_sub(1),
+                flags: gcc::MonitorFlags::PRIMARY,
+            }],
+        }),
         // Request the MCS message channel, which carries network auto-detect
         // ([MS-RDPBCGR] 2.2.14) and the multitransport / heartbeat PDUs. The
         // server assigns its ID in Server Message Channel Data.
