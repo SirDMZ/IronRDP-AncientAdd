@@ -1,20 +1,52 @@
-<h1 align="center">IronRDP</h1>
+<h1 align="center">IronRDP-AncientAdd</h1>
 
 <p align="center">
   <strong>A Rust implementation of the Microsoft Remote Desktop Protocol, with a focus on security.</strong>
 </p>
 
 <p align="center">
-  <a href="https://crates.io/crates/ironrdp"><img src="https://img.shields.io/crates/v/ironrdp?logo=rust" alt="crates.io"></a>
-  <a href="https://docs.rs/ironrdp/"><img src="https://docs.rs/ironrdp/badge.svg" alt="docs.rs"></a>
-  <a href="https://github.com/Devolutions/IronRDP/actions/workflows/ci.yml"><img src="https://github.com/Devolutions/IronRDP/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue" alt="License: MIT OR Apache-2.0">
-  <a href="https://matrix.to/#/#IronRDP:matrix.org"><img src="https://img.shields.io/badge/chat-matrix-brightgreen?logo=matrix" alt="Matrix"></a>
 </p>
 
 IronRDP is a modular Rust implementation of RDP, the protocol behind Windows Remote Desktop.
 It is not a monolithic client: its composable crates provide PDU codecs, connection and session state machines, virtual channels, and image codecs for native, WebAssembly, and .NET clients, servers, and proxies.
 The continuously fuzzed, `no_std`-compatible core performs no I/O, so applications supply the transport and runtime.
+
+## About this fork
+
+**IronRDP-AncientAdd** is a downstream fork of [Devolutions IronRDP][upstream]. Its
+additions came out of a *rip-and-tear, forced retarget* of the client onto a **legacy
+RDS deployment** — an environment that only speaks the old transports and expects the
+client to meet it there, not the other way around. Rather than keep the workarounds
+private, the reusable parts are collected here to borrow or upstream. Everything after
+this section is upstream IronRDP.
+
+The backport was performed by **Claude Opus 4.8** and validated by a human operator
+against the original target server, confirming the retargeted client still connects and
+renders correctly. It does not claim to meet upstream's contribution bar, but it is kept
+as close to upstream conventions as practical so individual changes stay cherry-pickable.
+
+### What the target needed — and therefore what changed
+
+The additions are a portrait of the server they were built for:
+
+- It sits behind an **RD Gateway that only speaks RPC-over-HTTP** (classic MS-TSGU), not
+  the newer WebSocket transport → a from-scratch **`ironrdp-tsgu-rpc`** transport crate,
+  exposed in the viewer as `--gw-rpc` (with an optional `--gw-domain`).
+- It streams the desktop with the **legacy RemoteFX Progressive + ClearCodec** pipeline
+  rather than H.264/AVC → progressive / ClearCodec / EGFX decode-robustness fixes and
+  **runtime-selectable progressive decode variants** (`--graphics-upgrade 1|2|3`).
+- It negotiates with the **older MS-RDPBCGR network auto-detection** → connect-time and
+  continuous **bandwidth measurement**.
+- The build host is a **Windows box with no C toolchain** → a **pure-Rust RustCrypto TLS**
+  backend and **PCM audio via cpal**, so the whole client builds and plays sound with no
+  CMake, NASM, or C compiler:
+  `cargo build -p ironrdp-viewer --no-default-features --features rustls-rustcrypto,sound`
+  (Opus stays available through an opt-in `sound-opus` for hosts that have a C toolchain).
+
+See the [viewer README] for the full option list.
+
+[upstream]: https://github.com/Devolutions/IronRDP
 
 ## Highlights
 
