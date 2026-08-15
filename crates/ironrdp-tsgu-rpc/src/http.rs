@@ -27,7 +27,7 @@ mod ws2_32 {
     use core::ffi::c_void;
 
     #[link(name = "ws2_32")]
-    extern "system" {
+    unsafe extern "system" {
         pub fn WSAIoctl(
             s: usize, // SOCKET (UINT_PTR)
             io_control_code: u32,
