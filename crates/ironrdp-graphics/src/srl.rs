@@ -108,6 +108,109 @@ pub fn decode_srl(data: &[u8], num_values: usize, num_bits: u8) -> Vec<i16> {
     output
 }
 
+/// A stateful SRL decoder that threads its bit position **and** adaptive `kp`/`nz`
+/// run state across successive [`next_value`](SrlReader::next_value) calls.
+///
+/// This matters for RFX Progressive TILE_UPGRADE: a component (Y/Cb/Cr) carries a
+/// **single** SRL stream shared by all ten DWT subbands, and the adaptive state
+/// and a zero-run may straddle subband boundaries (FreeRDP threads one
+/// `RFX_PROGRESSIVE_UPGRADE_STATE` through every band). Decoding each band with a
+/// fresh [`decode_srl`] call — restarting the bit position and `kp`/`nz` at zero —
+/// re-consumes the same leading bytes for every band and corrupts every subband
+/// after the first refined one. Keep one `SrlReader` for the whole component.
+///
+/// This is the threaded reader used by the v2/v3 progressive upgrade variants; the
+/// standalone [`decode_srl`] above is the v1 baseline (fresh per band).
+///
+/// `num_bits` is supplied per call because it is the *current band's* magnitude
+/// width and differs between bands; only the non-zero magnitude decode uses it,
+/// while the zero-run machinery is driven entirely by the persistent `kp`.
+pub struct SrlReader<'a> {
+    reader: BitReader<'a>,
+    kp: u32,
+    nz: u32, // remaining zeros in the current run
+    /// Escape state: `true` once a `'1'` zero-run escape has been read, meaning the
+    /// next value (after any remainder zeros drain) is a magnitude, not a fresh
+    /// zero-run. FreeRDP's `RFX_PROGRESSIVE_UPGRADE_STATE.mode` — without it, the
+    /// remainder-zeros-then-magnitude case desyncs the stream.
+    mode: bool,
+}
+
+impl<'a> SrlReader<'a> {
+    pub fn new(data: &'a [u8]) -> Self {
+        Self {
+            reader: BitReader::new(data),
+            // FreeRDP inits `state.kp = 8` (progressive.c:1272) → initial Golomb
+            // k = kp>>3 = 1 (chunk size 2), mirroring RLGR1's `kp = k<<3`. Starting
+            // at 0 parses every leading zero-run with the wrong chunk size and
+            // desyncs the stream from the first value.
+            kp: 8,
+            nz: 0,
+            mode: false,
+        }
+    }
+
+    /// Decode one coefficient magnitude (signed), advancing the shared state.
+    /// A returned `0` means the coefficient stays zero after this upgrade pass.
+    pub fn next_value(&mut self, num_bits: u8) -> i16 {
+        // Still emitting zeros from a previous run.
+        if self.nz > 0 {
+            self.nz -= 1;
+            return 0;
+        }
+
+        let k = self.kp >> 3;
+
+        if !self.mode {
+            // Zero-encoding block.
+            if !self.reader.read_bit() {
+                // '0': a full run of `1 << k` zeros; emit the first, hold the rest.
+                self.nz = 1u32.checked_shl(k).unwrap_or(0);
+                self.kp = (self.kp + 4).min(80);
+                self.nz = self.nz.saturating_sub(1);
+                return 0;
+            }
+            // '1' escape: a short run of `read_bits(k)` zeros, then a magnitude.
+            // Setting `mode` is what makes the *next* value (after these zeros
+            // drain) a magnitude instead of a fresh zero-run — the FreeRDP state
+            // machine (progressive.c L1108-1133).
+            self.mode = true;
+            self.nz = self.reader.read_bits(k);
+            if self.nz > 0 {
+                self.nz -= 1;
+                return 0;
+            }
+            // No remainder zeros — fall through to the magnitude in this call.
+        }
+
+        // Value (magnitude) block; clear `mode` so the next value starts a new run.
+        self.mode = false;
+        let sign = self.reader.read_bit();
+        self.kp = self.kp.saturating_sub(6);
+        if num_bits <= 1 {
+            return if sign { -1 } else { 1 };
+        }
+
+        // Truncated unary magnitude (FreeRDP progressive.c L1150-1159): count from
+        // 1 up to `max = (1 << numBits) - 1`, one bit per step, no remainder bits —
+        // NOT Golomb-Rice. The terminating 1-bit is omitted once `mag == max`.
+        let max = (1u32 << u32::from(num_bits).min(16)) - 1;
+        let mut mag: u32 = 1;
+        while mag < max {
+            if self.reader.read_bit() {
+                break;
+            }
+            mag += 1;
+        }
+        let value = i16::try_from(mag.min(0x7FFF)).unwrap_or(i16::MAX);
+        if sign {
+            -value
+        } else {
+            value
+        }
+    }
+}
+
 /// Encode coefficient magnitudes using the SRL algorithm.
 ///
 /// `values` contains signed coefficient values (non-zero = needs encoding,
@@ -343,6 +446,24 @@ mod tests {
         let encoded = encode_srl(&original, 4);
         let decoded = decode_srl(&encoded, original.len(), 4);
         assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn srl_reader_decodes_single_positive_magnitude() {
+        // Bits 1001 (num_bits=2): '1' escape, '0' no remainder zeros, '0' sign +,
+        // truncated-unary magnitude terminates immediately -> +1.
+        let mut reader = SrlReader::new(&[0b1001_0000]);
+        assert_eq!(reader.next_value(2), 1);
+    }
+
+    #[test]
+    fn srl_reader_threads_bit_position_across_values() {
+        // A single reader must advance its bit position across successive values
+        // (kp=8 init, truncated-unary). A per-value restart would decode the first
+        // magnitude (+1) again instead of draining the trailing zeros.
+        let mut reader = SrlReader::new(&[0b1001_0000, 0x00]);
+        let values: Vec<i16> = core::iter::repeat_with(|| reader.next_value(2)).take(6).collect();
+        assert_eq!(values, vec![1, 0, 0, 0, 0, 0]);
     }
 
     #[test]
