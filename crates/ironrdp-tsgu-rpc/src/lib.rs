@@ -108,7 +108,7 @@ pub struct GatewayParams {
 /// real RDP host (`target_host:target_port`) is named later, in the TSGU
 /// `TsProxyCreateChannel` NDR call (Layer 4). Putting the RDP target here instead
 /// makes the proxy try to reach 3389 as an RPC server and fail with
-/// `503 RPC Error: 6ba` (RPC_S_SERVER_UNAVAILABLE).
+/// `503 RPC Error: 0x6ba` (RPC_S_SERVER_UNAVAILABLE).
 fn rpc_uri() -> String {
     "/rpc/rpcproxy.dll?localhost:3388".to_owned()
 }
