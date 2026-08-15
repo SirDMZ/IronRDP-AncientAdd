@@ -384,6 +384,36 @@ enum ClientState {
 // Graphics Pipeline Client
 // ============================================================================
 
+/// How [`GraphicsPipelineClient`] acknowledges decoded frames to the server.
+///
+/// The server uses the [2.2.2.13] Frame Acknowledge PDU for frame flow control:
+/// with a bounded queue depth it can gate frame delivery on the client keeping up
+/// with acknowledgements.
+///
+/// [2.2.2.13]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/0241e258-77ef-4a58-b426-5039ed6296ce
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FrameAckMode {
+    /// Acknowledge every `EndFrame` with the current queue depth (default).
+    ///
+    /// Gives the server accurate backpressure for frame pacing, at the cost of
+    /// tying its frame rate to the client's decode rate when the server gates frame
+    /// delivery on acknowledgements.
+    #[default]
+    PerFrame,
+    /// Acknowledge only the first decoded frame, with `queueDepth` set to the
+    /// suspend sentinel [`QueueDepth::Suspend`] (`0xFFFFFFFF`), and send no further
+    /// acknowledgements.
+    ///
+    /// Per [2.2.2.13] this suspends server-side frame flow control so the server
+    /// streams continuously rather than waiting on per-frame acknowledgements. It
+    /// helps when a slow synchronous decode path would otherwise throttle the
+    /// server, but a server that does not honor the suspend request may grow its
+    /// unacknowledged-frames list, so it is opt-in.
+    ///
+    /// [2.2.2.13]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/0241e258-77ef-4a58-b426-5039ed6296ce
+    SuspendAfterFirst,
+}
+
 /// Client for the Graphics Pipeline Virtual Channel (EGFX)
 ///
 /// This client handles capability negotiation, surface tracking,
@@ -408,6 +438,7 @@ pub struct GraphicsPipelineClient {
     current_frame_id: Option<u32>,
     frames_queued: u32,
     total_frames_decoded: u32,
+    frame_ack_mode: FrameAckMode,
 }
 
 impl GraphicsPipelineClient {
@@ -431,7 +462,18 @@ impl GraphicsPipelineClient {
             current_frame_id: None,
             frames_queued: 0,
             total_frames_decoded: 0,
+            frame_ack_mode: FrameAckMode::default(),
         }
+    }
+
+    /// Set how the client acknowledges decoded frames to the server.
+    ///
+    /// Defaults to [`FrameAckMode::PerFrame`]. See [`FrameAckMode`] for the
+    /// trade-offs of suspending frame acknowledgement.
+    #[must_use]
+    pub fn with_frame_ack_mode(mut self, mode: FrameAckMode) -> Self {
+        self.frame_ack_mode = mode;
+        self
     }
 
     // ========================================================================
@@ -957,16 +999,35 @@ impl GraphicsPipelineClient {
         self.handler.on_frame_complete(frame_id);
 
         // Per [3.3.5.12]: client MUST send FrameAcknowledge after EndFrame.
-        // We send the actual queue depth (not Unavailable / 0xFFFFFFFF as FreeRDP does);
-        // the real value gives the server backpressure information for frame pacing.
-        let ack = GfxPdu::FrameAcknowledge(FrameAcknowledgePdu {
-            queue_depth: QueueDepth::from_u32(self.frames_queued),
-            frame_id,
-            total_frames_decoded: self.total_frames_decoded,
-        });
+        let messages = match self.frame_ack_mode {
+            FrameAckMode::PerFrame => {
+                // Acknowledge every frame with the actual queue depth (not Unavailable /
+                // 0xFFFFFFFF as FreeRDP does); the real value gives the server
+                // backpressure information for frame pacing.
+                let ack = GfxPdu::FrameAcknowledge(FrameAcknowledgePdu {
+                    queue_depth: QueueDepth::from_u32(self.frames_queued),
+                    frame_id,
+                    total_frames_decoded: self.total_frames_decoded,
+                });
+                trace!(frame_id, "Sending FrameAcknowledge");
+                vec![Box::new(ack) as DvcMessage]
+            }
+            FrameAckMode::SuspendAfterFirst if self.total_frames_decoded == 1 => {
+                // Acknowledge only the first frame with the suspend sentinel so the
+                // server stops gating delivery on per-frame acknowledgements
+                // ([MS-RDPEGFX] 2.2.2.13); send nothing on later frames.
+                let ack = GfxPdu::FrameAcknowledge(FrameAcknowledgePdu {
+                    queue_depth: QueueDepth::Suspend,
+                    frame_id,
+                    total_frames_decoded: self.total_frames_decoded,
+                });
+                trace!(frame_id, "Sending FrameAcknowledge (suspend, once)");
+                vec![Box::new(ack) as DvcMessage]
+            }
+            FrameAckMode::SuspendAfterFirst => Vec::new(),
+        };
 
-        trace!(frame_id, "Sending FrameAcknowledge");
-        Ok(vec![Box::new(ack) as DvcMessage])
+        Ok(messages)
     }
 }
 
@@ -1373,6 +1434,44 @@ mod tests {
             &[7],
             "DeleteSurface for an untracked id must still be forwarded to the handler"
         );
+    }
+
+    /// By default the client acknowledges every decoded frame (per-frame flow
+    /// control), so each `EndFrame` yields exactly one FrameAcknowledge.
+    #[test]
+    fn frame_ack_per_frame_acks_every_frame() {
+        let mut client = GraphicsPipelineClient::new(Box::new(TestHandler), None);
+        for frame_id in 0..3 {
+            let acks = client
+                .handle_pdu(GfxPdu::EndFrame(crate::pdu::EndFramePdu { frame_id }))
+                .expect("end frame");
+            assert_eq!(acks.len(), 1, "PerFrame must acknowledge every frame");
+        }
+        assert_eq!(client.total_frames_decoded(), 3);
+    }
+
+    /// With `SuspendAfterFirst`, the client acknowledges only the first decoded
+    /// frame (with the suspend sentinel) and stays silent afterwards, so the server
+    /// stops gating delivery on per-frame acknowledgements ([MS-RDPEGFX] 2.2.2.13).
+    #[test]
+    fn frame_ack_suspend_after_first_acks_once() {
+        let mut client = GraphicsPipelineClient::new(Box::new(TestHandler), None)
+            .with_frame_ack_mode(FrameAckMode::SuspendAfterFirst);
+
+        let first = client
+            .handle_pdu(GfxPdu::EndFrame(crate::pdu::EndFramePdu { frame_id: 1 }))
+            .expect("first end frame");
+        assert_eq!(first.len(), 1, "the first frame must be acknowledged once (suspend)");
+
+        for frame_id in 2..5 {
+            let acks = client
+                .handle_pdu(GfxPdu::EndFrame(crate::pdu::EndFramePdu { frame_id }))
+                .expect("later end frame");
+            assert!(
+                acks.is_empty(),
+                "frame {frame_id} must not be acknowledged after suspend"
+            );
+        }
     }
 
     #[test]
