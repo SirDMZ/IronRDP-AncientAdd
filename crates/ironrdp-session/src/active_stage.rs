@@ -176,6 +176,12 @@ impl ActiveStage {
         action: Action,
         frame: &[u8],
     ) -> SessionResult<Vec<ActiveStageOutput>> {
+        // Tally every inbound frame toward an open continuous network auto-detect
+        // bandwidth-measurement window ([MS-RDPBCGR] 2.2.14). This is the one place
+        // fast-path and X.224 traffic converge; the call is a no-op unless a window
+        // is open.
+        self.x224_processor.count_bw_bytes(frame.len());
+
         let (mut stage_outputs, processor_updates) = match action {
             Action::FastPath => {
                 let mut output = WriteBuf::new();

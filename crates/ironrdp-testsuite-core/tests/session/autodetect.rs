@@ -124,13 +124,50 @@ fn bandwidth_measure_start_does_not_crash() {
 }
 
 #[test]
-fn bandwidth_measure_stop_does_not_crash() {
+fn bandwidth_measure_stop_replies_with_results() {
     let mut processor = make_processor();
-    let request = AutoDetectRequest::bw_stop_continuous(200);
-    let frame = encode_server_autodetect(request);
 
-    let outputs = process_frame(&mut processor, &frame);
-    assert!(outputs.is_empty(), "BW stop should produce no output");
+    // Start opens the measurement window (no output).
+    let start = encode_server_autodetect(AutoDetectRequest::bw_start_continuous(5));
+    assert!(
+        process_frame(&mut processor, &start).is_empty(),
+        "BW start should produce no output"
+    );
+
+    // Inbound traffic during the window is tallied; ActiveStage feeds these bytes.
+    processor.count_bw_bytes(1000);
+    processor.count_bw_bytes(500);
+
+    // Stop closes the window and replies with a Bandwidth Measure Results PDU
+    // ([MS-RDPBCGR] 2.2.14.1.4) so the server learns the measured throughput.
+    let stop = encode_server_autodetect(AutoDetectRequest::bw_stop_continuous(5));
+    let outputs = process_frame(&mut processor, &stop);
+    assert_eq!(outputs.len(), 1, "BW stop must reply with results");
+
+    let ironrdp_session::x224::ProcessorOutput::ResponseFrame(data) = &outputs[0] else {
+        panic!("expected ResponseFrame");
+    };
+    let mcs_msg = ironrdp_core::decode::<X224<McsMessage<'_>>>(data).unwrap();
+    let McsMessage::SendDataRequest(send_data) = mcs_msg.0 else {
+        panic!("expected SendDataRequest in response frame");
+    };
+    assert_eq!(
+        send_data.channel_id, MESSAGE_CHANNEL_ID,
+        "results must be sent on the message channel"
+    );
+
+    let response = ironrdp_core::decode::<AutoDetectRspPdu>(&send_data.user_data).unwrap();
+    match response.response {
+        AutoDetectResponse::BandwidthMeasureResults {
+            sequence_number,
+            byte_count,
+            ..
+        } => {
+            assert_eq!(sequence_number, 5, "sequence number must be echoed");
+            assert_eq!(byte_count, 1500, "byte_count must reflect the tallied inbound bytes");
+        }
+        other => panic!("expected BandwidthMeasureResults, got {other:?}"),
+    }
 }
 
 #[test]

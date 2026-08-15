@@ -99,6 +99,15 @@ pub struct Processor {
     io_channel_id: u16,
     message_channel_id: Option<u16>,
     share_id: u32,
+    /// Continuous network auto-detect ([MS-RDPBCGR] 2.2.14) bandwidth-measurement
+    /// state. Between a Bandwidth Measure Start and Stop the server relies on the
+    /// ambient inbound PDU traffic as the measurement payload, so the window is timed
+    /// (`bw_measure_start`) and every inbound PDU's byte length is tallied
+    /// (`bw_measure_bytes`) while `bw_measuring` is set, then reported on the Stop.
+    /// Mirrors FreeRDP's `autodetect_recv_bandwidth_measure_*`.
+    bw_measure_start: Option<std::time::Instant>,
+    bw_measure_bytes: u32,
+    bw_measuring: bool,
 }
 
 impl Processor {
@@ -115,11 +124,35 @@ impl Processor {
             io_channel_id,
             message_channel_id,
             share_id,
+            bw_measure_start: None,
+            bw_measure_bytes: 0,
+            bw_measuring: false,
         }
     }
 
     pub fn set_share_id(&mut self, share_id: u32) {
         self.share_id = share_id;
+    }
+
+    /// Whether a continuous network auto-detect bandwidth-measurement window is
+    /// currently open (between a Bandwidth Measure Start and Stop). While open, the
+    /// caller must feed every inbound PDU's byte length to [`count_bw_bytes`] so the
+    /// Bandwidth Measure Results reflect real throughput.
+    ///
+    /// [`count_bw_bytes`]: Self::count_bw_bytes
+    pub fn bw_measuring(&self) -> bool {
+        self.bw_measuring
+    }
+
+    /// Tally `n` inbound bytes toward the open bandwidth-measurement window. A no-op
+    /// unless [`bw_measuring`](Self::bw_measuring) is set. Counts both fast-path and
+    /// X.224 traffic, mirroring FreeRDP which tallies every received PDU.
+    pub fn count_bw_bytes(&mut self, n: usize) {
+        if self.bw_measuring {
+            self.bw_measure_bytes = self
+                .bw_measure_bytes
+                .saturating_add(u32::try_from(n).unwrap_or(u32::MAX));
+        }
     }
 
     /// Updates the negotiated maximum payload length of outgoing static virtual channel chunks.
@@ -373,7 +406,9 @@ impl Processor {
     /// During continuous auto-detection ([MS-RDPBCGR] 2.2.14) the server sends
     /// RTT (and bandwidth) requests on the message channel; the client answers
     /// RTT requests and surfaces the final Network Characteristics Result.
-    fn process_message_channel(&self, data_ctx: SendDataIndicationCtx<'_>) -> SessionResult<Vec<ProcessorOutput>> {
+    fn process_message_channel(&mut self, data_ctx: SendDataIndicationCtx<'_>) -> SessionResult<Vec<ProcessorOutput>> {
+        use ironrdp_pdu::rdp::autodetect::{BW_RESULTS_CONNECT_TIME, BW_RESULTS_CONTINUOUS, BW_STOP_CONNECT_TIME};
+
         let Some(message_channel_id) = self.message_channel_id else {
             return Err(reason_err!("message channel", "no message channel negotiated"));
         };
@@ -382,27 +417,86 @@ impl Processor {
 
         match req.request {
             AutoDetectRequest::RttRequest { sequence_number, .. } => {
-                let response = AutoDetectRspPdu::new(AutoDetectResponse::RttResponse { sequence_number });
-                let mut frame = WriteBuf::new();
-                ironrdp_pdu::mcs::encode_send_data_request(
-                    self.user_channel_id,
-                    message_channel_id,
-                    &response,
-                    &mut frame,
-                )
-                .map_err(SessionError::encode)?;
                 debug!(sequence_number, "Responded to auto-detect RTT request");
-                Ok(vec![ProcessorOutput::ResponseFrame(frame.into_inner())])
+                self.encode_autodetect_response(message_channel_id, AutoDetectResponse::RttResponse { sequence_number })
+            }
+            // Bandwidth Measure Start ([MS-RDPBCGR] 2.2.14.1.2): open the measurement
+            // window. In continuous mode there is no payload PDU; the server relies on
+            // the ambient inbound traffic between Start and Stop, so just latch the
+            // clock and byte counter and count subsequent PDUs in `process`.
+            AutoDetectRequest::BandwidthMeasureStart { sequence_number, .. } => {
+                self.bw_measure_start = Some(std::time::Instant::now());
+                self.bw_measure_bytes = 0;
+                self.bw_measuring = true;
+                debug!(sequence_number, "Auto-detect bandwidth measure started");
+                Ok(Vec::new())
+            }
+            // Bandwidth Measure Payload ([MS-RDPBCGR] 2.2.14.1.3): connect-time only,
+            // but count it if a server sends one mid-session.
+            AutoDetectRequest::BandwidthMeasurePayload { payload, .. } => {
+                self.bw_measure_bytes = self
+                    .bw_measure_bytes
+                    .saturating_add(u32::try_from(payload.len()).unwrap_or(u32::MAX));
+                Ok(Vec::new())
+            }
+            // Bandwidth Measure Stop ([MS-RDPBCGR] 2.2.14.1.4): close the window and
+            // reply with Bandwidth Measure Results so the server learns our throughput.
+            // timeDelta = elapsed since Start; byteCount = bytes tallied in the window.
+            AutoDetectRequest::BandwidthMeasureStop {
+                sequence_number,
+                request_type,
+                payload,
+            } => {
+                if let Some(bytes) = payload {
+                    self.bw_measure_bytes = self
+                        .bw_measure_bytes
+                        .saturating_add(u32::try_from(bytes.len()).unwrap_or(u32::MAX));
+                }
+                let time_delta_ms = self
+                    .bw_measure_start
+                    .take()
+                    .map(|start| u32::try_from(start.elapsed().as_millis()).unwrap_or(u32::MAX))
+                    .unwrap_or(0);
+                let byte_count = self.bw_measure_bytes;
+                self.bw_measuring = false;
+                let response_type = if request_type == BW_STOP_CONNECT_TIME {
+                    BW_RESULTS_CONNECT_TIME
+                } else {
+                    BW_RESULTS_CONTINUOUS
+                };
+                debug!(
+                    sequence_number,
+                    time_delta_ms, byte_count, "Sent auto-detect bandwidth results"
+                );
+                self.encode_autodetect_response(
+                    message_channel_id,
+                    AutoDetectResponse::BandwidthMeasureResults {
+                        sequence_number,
+                        response_type,
+                        time_delta_ms,
+                        byte_count,
+                    },
+                )
             }
             req @ AutoDetectRequest::NetworkCharacteristicsResult { .. } => {
                 debug!(?req, "Received network characteristics from server");
                 Ok(vec![ProcessorOutput::AutoDetect(req)])
             }
-            req => {
-                debug!(?req, "Auto-detect request not yet implemented");
-                Ok(Vec::new())
-            }
         }
+    }
+
+    /// Encode an [`AutoDetectResponse`] as a Send Data Request on the message
+    /// channel, returning it as a single [`ProcessorOutput::ResponseFrame`].
+    fn encode_autodetect_response(
+        &self,
+        message_channel_id: u16,
+        response: AutoDetectResponse,
+    ) -> SessionResult<Vec<ProcessorOutput>> {
+        let response = AutoDetectRspPdu::new(response);
+        let mut frame = WriteBuf::new();
+        ironrdp_pdu::mcs::encode_send_data_request(self.user_channel_id, message_channel_id, &response, &mut frame)
+            .map_err(SessionError::encode)?;
+        Ok(vec![ProcessorOutput::ResponseFrame(frame.into_inner())])
     }
 
     /// Send a pdu on the static global channel. Typically used to send input events
