@@ -43,6 +43,7 @@ rustls-rustcrypto = ["ironrdp-client?/rustls-rustcrypto", "ironrdp-mstsgu?/rustl
 native-tls = ["ironrdp-client?/native-tls", "ironrdp-mstsgu?/native-tls"]
 # Optional client subsystems, forwarded so consumers can opt in without naming `ironrdp-client`.
 client-sound = ["ironrdp-client?/sound"]
+client-sound-opus = ["ironrdp-client?/sound-opus"]
 client-clipboard = ["ironrdp-client?/clipboard"]
 client-rdpdr = ["ironrdp-client?/rdpdr"]
 client-smartcard = ["ironrdp-client?/smartcard"]

@@ -28,10 +28,12 @@ rustls = ["ironrdp/rustls", "ironrdp-daemon/rustls"]
 # and the aws-lc-rs crypto provider — no CMake/NASM required).
 rustls-rustcrypto = ["ironrdp/rustls-rustcrypto", "ironrdp-daemon/rustls-rustcrypto"]
 native-tls = ["ironrdp/native-tls", "ironrdp-daemon/native-tls"]
-# Audio output/input redirection. On by default, but it pulls in a bundled libopus
-# built via CMake; disable it (`--no-default-features --features rustls`) to build
-# without a CMake/C toolchain when audio is not needed.
+# Audio output/input redirection. PCM-only via cpal, so it needs no CMake/C toolchain
+# (WASAPI on Windows, CoreAudio on macOS, system ALSA on Linux). On by default.
 sound = ["ironrdp/client-sound"]
+# Add Opus to audio (bandwidth saving) — pulls a CMake-built libopus, reintroducing the
+# C-toolchain build requirement. Opt-in on top of `sound`.
+sound-opus = ["sound", "ironrdp/client-sound-opus"]
 qoi = ["ironrdp/qoi"]
 qoiz = ["ironrdp/qoiz"]
 
