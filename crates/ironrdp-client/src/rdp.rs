@@ -1461,7 +1461,7 @@ async fn connect_gateway(
             port: gw_port,
             username: gw.username.clone(),
             password: gw.password.clone(),
-            domain: None,
+            domain: gw.domain.clone(),
             target_host: config.destination.name().to_owned(),
             target_port: config.destination.port(),
         };

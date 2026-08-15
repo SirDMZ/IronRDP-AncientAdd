@@ -76,6 +76,10 @@ struct Args {
     gw_user: Option<String>,
     #[clap(long, value_parser)]
     gw_pass: Option<String>,
+    /// Domain for the gateway account's NTLM auth (independent of the target `-d`
+    /// domain). Some RD Gateways require `DOMAIN\user`; supply the domain here.
+    #[clap(long, value_parser)]
+    gw_domain: Option<String>,
     /// Use the RPC-over-HTTP gateway transport (MS-TSGU over MS-RPCH) instead of the
     /// default WebSocket transport. Requires `--gw-endpoint` and the `gateway-rpc` feature.
     #[clap(long = "gw-rpc", requires = "gw_endpoint")]
@@ -469,6 +473,9 @@ fn apply_cli_to_builder(
         }
         if let Some(password) = args.gw_pass {
             builder = builder.with_gateway_password(password);
+        }
+        if let Some(gw_domain) = args.gw_domain {
+            builder = builder.with_gateway_domain(gw_domain);
         }
         builder = builder.with_gateway_rpc(args.gw_rpc);
     }

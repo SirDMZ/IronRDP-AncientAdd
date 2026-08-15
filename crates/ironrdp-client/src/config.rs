@@ -421,6 +421,9 @@ pub struct GatewayConfig {
     pub username: String,
     /// Gateway password.
     pub password: String,
+    /// Optional gateway account domain (NetBIOS or FQDN), used for the gateway's own
+    /// NTLM authentication. Independent of the inner RDP account domain.
+    pub domain: Option<String>,
     /// Use the RPC-over-HTTP transport (`ironrdp-tsgu-rpc`) instead of the default
     /// WebSocket transport. Requires the `gateway-rpc` feature.
     pub rpc: bool,
@@ -636,6 +639,7 @@ pub struct ConfigBuilder {
     platform: Option<ironrdp_pdu::rdp::capability_sets::MajorPlatformType>,
     gateway_username: Option<String>,
     gateway_password: Option<String>,
+    gateway_domain: Option<String>,
     gateway_rpc: bool,
 
     // Optional (defaulted at build time).
@@ -756,6 +760,14 @@ impl ConfigBuilder {
     #[must_use]
     pub fn with_gateway_password(mut self, password: impl Into<String>) -> Self {
         self.gateway_password = Some(password.into());
+        self
+    }
+
+    /// Set the domain used for the gateway's own NTLM authentication (independent of
+    /// the inner RDP account domain set via [`with_domain`](Self::with_domain)).
+    #[must_use]
+    pub fn with_gateway_domain(mut self, domain: impl Into<String>) -> Self {
+        self.gateway_domain = Some(domain.into());
         self
     }
 
@@ -1485,6 +1497,7 @@ impl ConfigBuilder {
                 endpoint,
                 username: self.gateway_username.unwrap(),
                 password: self.gateway_password.unwrap(),
+                domain: self.gateway_domain,
                 rpc: self.gateway_rpc,
             }),
             TransportKind::RDCleanPath { url } => Transport::RDCleanPath(RDCleanPathConfig {
