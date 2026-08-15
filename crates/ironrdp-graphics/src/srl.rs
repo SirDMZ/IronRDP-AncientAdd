@@ -203,11 +203,7 @@ impl<'a> SrlReader<'a> {
             mag += 1;
         }
         let value = i16::try_from(mag.min(0x7FFF)).unwrap_or(i16::MAX);
-        if sign {
-            -value
-        } else {
-            value
-        }
+        if sign { -value } else { value }
     }
 }
 

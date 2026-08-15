@@ -1802,10 +1802,28 @@ mod tests {
     #[test]
     fn upgrade_v2_threads_srl_across_bands() {
         let prev = ComponentCodecQuant {
-            ll3: 0, hl3: 0, lh3: 0, hh3: 0, hl2: 0, lh2: 0, hh2: 0, hl1: 2, lh1: 2, hh1: 0,
+            ll3: 0,
+            hl3: 0,
+            lh3: 0,
+            hh3: 0,
+            hl2: 0,
+            lh2: 0,
+            hh2: 0,
+            hl1: 2,
+            lh1: 2,
+            hh1: 0,
         };
         let curr = ComponentCodecQuant {
-            ll3: 0, hl3: 0, lh3: 0, hh3: 0, hl2: 0, lh2: 0, hh2: 0, hl1: 0, lh1: 0, hh1: 0,
+            ll3: 0,
+            hl3: 0,
+            lh3: 0,
+            hh3: 0,
+            hl2: 0,
+            lh2: 0,
+            hh2: 0,
+            hl1: 0,
+            lh1: 0,
+            hh1: 0,
         };
         let bands = get_band_layout(false);
         let (hl1, lh1) = (bands[0], bands[1]);
