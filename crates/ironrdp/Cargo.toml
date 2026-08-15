@@ -52,6 +52,9 @@ client-all = ["ironrdp-client?/all"]
 vmconnect = ["dep:ironrdp-vmconnect"]
 qoi = ["ironrdp-server?/qoi", "ironrdp-pdu?/qoi", "ironrdp-connector?/qoi", "ironrdp-session?/qoi", "ironrdp-client?/qoi"]
 qoiz = ["ironrdp-server?/qoiz", "ironrdp-pdu?/qoiz", "ironrdp-connector?/qoiz", "ironrdp-session?/qoiz", "ironrdp-client?/qoiz"]
+# Smart-card (MS-RDPESC) CredSSP logon via the connector; off by default because it
+# pulls a C toolchain (winscard -> libz-sys). See ironrdp-connector's `scard` feature.
+scard = ["ironrdp-connector?/scard"]
 
 # Internal (PRIVATE!) features used to aid testing.
 # Don't rely on these whatsoever. They may disappear at any time.

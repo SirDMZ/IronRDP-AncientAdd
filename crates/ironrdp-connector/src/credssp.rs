@@ -1,10 +1,17 @@
 use ironrdp_core::{WriteBuf, other_err};
 use ironrdp_pdu::{PduHint, nego};
+// Smart-card credential support pulls sspi's `scard` feature (winscard, and through
+// it a C toolchain), so these imports are gated behind the default-off `scard`
+// feature and used only by the smart-card credential path.
+#[cfg(feature = "scard")]
 use picky::key::PrivateKey;
+#[cfg(feature = "scard")]
 use picky_asn1_x509::{Certificate, ExtensionView, GeneralName, oids};
+#[cfg(feature = "scard")]
+use sspi::Secret;
+use sspi::Username;
 use sspi::credssp::{self, ClientState, CredSspClient};
 use sspi::generator::{Generator, NetworkRequest};
-use sspi::{Secret, Username};
 use tracing::debug;
 
 use crate::{
@@ -109,6 +116,13 @@ impl CredsspSequence {
                 }
                 .into()
             }
+            #[cfg(not(feature = "scard"))]
+            Credentials::SmartCard { .. } => {
+                return Err(general_err!(
+                    "smart card authentication is not supported in this build (scard feature disabled)"
+                ));
+            }
+            #[cfg(feature = "scard")]
             Credentials::SmartCard { pin, config } => match config {
                 Some(config) => {
                     let cert: Certificate = picky_asn1_der::from_bytes(&config.certificate)
@@ -241,10 +255,12 @@ impl CredsspSequence {
     }
 }
 
+#[cfg(feature = "scard")]
 fn extract_user_name(cert: &Certificate) -> Option<String> {
     cert.tbs_certificate.subject.find_common_name().map(ToString::to_string)
 }
 
+#[cfg(feature = "scard")]
 fn extract_user_principal_name(cert: &Certificate) -> Option<String> {
     cert.extensions()
         .iter()
