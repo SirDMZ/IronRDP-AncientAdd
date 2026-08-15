@@ -3282,6 +3282,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "ironrdp-tsgu-rpc"
+version = "0.0.1"
+dependencies = [
+ "base64",
+ "getrandom 0.4.3",
+ "ironrdp-tls",
+ "libc",
+ "sha2 0.10.9",
+ "sspi",
+ "thiserror 2.0.19",
+ "tokio",
+ "tracing",
+ "x509-cert",
+]
+
+[[package]]
 name = "ironrdp-viewer"
 version = "0.1.0"
 dependencies = [
