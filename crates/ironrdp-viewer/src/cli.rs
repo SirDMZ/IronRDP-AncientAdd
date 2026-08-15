@@ -76,6 +76,10 @@ struct Args {
     gw_user: Option<String>,
     #[clap(long, value_parser)]
     gw_pass: Option<String>,
+    /// Use the RPC-over-HTTP gateway transport (MS-TSGU over MS-RPCH) instead of the
+    /// default WebSocket transport. Requires `--gw-endpoint` and the `gateway-rpc` feature.
+    #[clap(long = "gw-rpc", requires = "gw_endpoint")]
+    gw_rpc: bool,
 
     /// An address on which the client will connect.
     #[clap(env = "RDP_HOSTNAME")]
@@ -455,6 +459,7 @@ fn apply_cli_to_builder(
         if let Some(password) = args.gw_pass {
             builder = builder.with_gateway_password(password);
         }
+        builder = builder.with_gateway_rpc(args.gw_rpc);
     }
 
     builder = builder.with_clipboard(resolve_clipboard_type(args.clipboard_type, redirect_clipboard));
