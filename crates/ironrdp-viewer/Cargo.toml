@@ -21,16 +21,38 @@ name = "ironrdp-viewer"
 test = false
 
 [features]
-default = ["rustls"]
+default = ["rustls", "sound"]
 rustls = ["ironrdp/rustls"]
 native-tls = ["ironrdp/native-tls"]
+# Audio output/input redirection. On by default, but it pulls in a bundled libopus
+# built via CMake; disable it (`--no-default-features --features rustls`) to build
+# without a CMake/C toolchain when audio is not needed.
+sound = ["ironrdp/client-sound"]
 qoi = ["ironrdp/qoi"]
 qoiz = ["ironrdp/qoiz"]
 
 [dependencies]
 ironrdp-daemon = { path = "../ironrdp-daemon", version = "0.1" } # public
 ironrdp-rpc = { path = "../ironrdp-rpc", version = "0.1" }
-ironrdp = { path = "../ironrdp", version = "0.17", features = ["connector", "cliprdr", "input", "pdu", "graphics", "client", "client-all", "client-vmconnect"] }
+# `client-all` minus `client-sound`, which is gated behind this crate's optional
+# `sound` feature above (audio pulls in a CMake-built libopus).
+ironrdp = { path = "../ironrdp", version = "0.17", features = [
+    "connector",
+    "cliprdr",
+    "input",
+    "pdu",
+    "graphics",
+    "client",
+    "client-clipboard",
+    "client-rdpdr",
+    "client-smartcard",
+    "client-gateway",
+    "client-gateway-rpc",
+    "client-dvc-pipe-proxy",
+    "client-dvc-com-plugin",
+    "client-webauthn",
+    "client-vmconnect",
+] }
 ironrdp-cfg = { path = "../ironrdp-cfg", version = "0.1" }
 ironrdp-propertyset = { path = "../ironrdp-propertyset", version = "0.1" }
 ironrdp-rdpfile = { path = "../ironrdp-rdpfile", version = "0.1" }
