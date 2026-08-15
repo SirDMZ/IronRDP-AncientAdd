@@ -22,12 +22,14 @@ rustls = [
     "ironrdp-tls/rustls",
     "tokio-tungstenite/rustls-tls-native-roots",
     "ironrdp-mstsgu?/rustls",
+    "ironrdp-tsgu-rpc?/rustls",
 ]
 
 native-tls = [
     "ironrdp-tls/native-tls",
     "tokio-tungstenite/native-tls",
     "ironrdp-mstsgu?/native-tls",
+    "ironrdp-tsgu-rpc?/native-tls",
 ]
 
 sound = [
@@ -40,6 +42,9 @@ clipboard = ["dep:ironrdp-cliprdr", "dep:ironrdp-cliprdr-native"]
 rdpdr = ["dep:ironrdp-rdpdr", "dep:ironrdp-rdpsnd"]
 smartcard = ["rdpdr"]
 gateway = ["dep:ironrdp-mstsgu"]
+# RPC-over-HTTP RD Gateway transport, layered on the `gateway` transport wiring
+# (an alternative to its WebSocket path, selected at runtime via `GatewayConfig::rpc`).
+gateway-rpc = ["gateway", "dep:ironrdp-tsgu-rpc"]
 qoi = ["ironrdp-connector/qoi", "ironrdp-session/qoi"]
 qoiz = ["ironrdp-connector/qoiz", "ironrdp-session/qoiz"]
 dvc-pipe-proxy = ["dep:ironrdp-dvc-pipe-proxy"]
@@ -55,6 +60,7 @@ all = [
     "rdpdr",
     "smartcard",
     "gateway",
+    "gateway-rpc",
     "dvc-pipe-proxy",
     "dvc-com-plugin",
     "webauthn",
@@ -91,6 +97,7 @@ ironrdp-rdpeai = { path = "../ironrdp-rdpeai", version = "0.1", optional = true 
 ironrdp-rdpsnd-native = { path = "../ironrdp-rdpsnd-native", version = "0.7", optional = true }
 ironrdp-cliprdr-native = { path = "../ironrdp-cliprdr-native", version = "0.7", optional = true }
 ironrdp-mstsgu = { path = "../ironrdp-mstsgu", version = "0.0.1", optional = true }
+ironrdp-tsgu-rpc = { path = "../ironrdp-tsgu-rpc", version = "0.0.1", optional = true }
 ironrdp-dvc-pipe-proxy = { path = "../ironrdp-dvc-pipe-proxy", version = "0.5", optional = true }
 
 # Logging

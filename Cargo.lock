@@ -2665,6 +2665,7 @@ dependencies = [
  "ironrdp-svc",
  "ironrdp-tls",
  "ironrdp-tokio",
+ "ironrdp-tsgu-rpc",
  "ironrdp-vmconnect",
  "smallvec",
  "tokio",

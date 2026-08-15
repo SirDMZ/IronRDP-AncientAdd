@@ -421,6 +421,9 @@ pub struct GatewayConfig {
     pub username: String,
     /// Gateway password.
     pub password: String,
+    /// Use the RPC-over-HTTP transport (`ironrdp-tsgu-rpc`) instead of the default
+    /// WebSocket transport. Requires the `gateway-rpc` feature.
+    pub rpc: bool,
 }
 
 // ── Destination ───────────────────────────────────────────────────────────────
@@ -633,6 +636,7 @@ pub struct ConfigBuilder {
     platform: Option<ironrdp_pdu::rdp::capability_sets::MajorPlatformType>,
     gateway_username: Option<String>,
     gateway_password: Option<String>,
+    gateway_rpc: bool,
 
     // Optional (defaulted at build time).
     domain: Option<String>,
@@ -737,6 +741,15 @@ impl ConfigBuilder {
         let username = username.into();
         self.gateway_username = Some(username.clone());
         self.properties.set_gateway_username(username);
+        self
+    }
+
+    /// Select the RPC-over-HTTP gateway transport instead of the default WebSocket
+    /// one. Only meaningful with a [`TransportKind::Gateway`] transport, and requires
+    /// the `gateway-rpc` feature at connect time.
+    #[must_use]
+    pub fn with_gateway_rpc(mut self, rpc: bool) -> Self {
+        self.gateway_rpc = rpc;
         self
     }
 
@@ -1472,6 +1485,7 @@ impl ConfigBuilder {
                 endpoint,
                 username: self.gateway_username.unwrap(),
                 password: self.gateway_password.unwrap(),
+                rpc: self.gateway_rpc,
             }),
             TransportKind::RDCleanPath { url } => Transport::RDCleanPath(RDCleanPathConfig {
                 url,

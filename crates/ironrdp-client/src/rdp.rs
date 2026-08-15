@@ -1441,6 +1441,69 @@ async fn connect_gateway(
         ));
     }
 
+    // RPC-over-HTTP transport (MS-TSGU over MS-RPCH), selected at runtime by
+    // `GatewayConfig::rpc`. `ironrdp-tsgu-rpc` opens the tunnel to the internal RDP
+    // target and yields an `AsyncRead + AsyncWrite` over which the standard RDP
+    // security upgrade runs, exactly like the other transports.
+    #[cfg(feature = "gateway-rpc")]
+    if gw.rpc {
+        // `endpoint` is `host` or `host:port`; the gateway speaks HTTPS, so default to 443.
+        let (gw_host, gw_port) = match gw.endpoint.rsplit_once(':') {
+            Some((host, port)) => match port.parse::<u16>() {
+                Ok(port) => (host.to_owned(), port),
+                Err(_) => (gw.endpoint.clone(), 443),
+            },
+            None => (gw.endpoint.clone(), 443),
+        };
+
+        let params = ironrdp_tsgu_rpc::GatewayParams {
+            host: gw_host,
+            port: gw_port,
+            username: gw.username.clone(),
+            password: gw.password.clone(),
+            domain: None,
+            target_host: config.destination.name().to_owned(),
+            target_port: config.destination.port(),
+        };
+
+        // Trust-on-first-use: the gateway's own TLS certificate is surfaced before any
+        // credential is sent. RD Gateways are commonly self-signed, so pin it and log
+        // the fingerprint for the operator to eyeball rather than reject on CA grounds.
+        let mut verify = |cert: &ironrdp_tsgu_rpc::CertInfo| {
+            info!(
+                gateway = %cert.host,
+                fingerprint = %cert.fingerprint(),
+                "Pinning gateway TLS certificate (trust-on-first-use)"
+            );
+            ironrdp_tsgu_rpc::TofuDecision::Pin
+        };
+
+        let (_cert, tunnel) = ironrdp_tsgu_rpc::open_tunnel(&params, &mut verify)
+            .await
+            .map_err(|e| ironrdp_connector::custom_err!("RPC gateway connect", e))?;
+
+        // The tunnel exposes no local socket address; advertise an unspecified client
+        // address in the Client Info PDU, as the named-pipe transport does.
+        let client_addr = SocketAddr::from(([0, 0, 0, 0], 0));
+        let framed = ironrdp_tokio::TokioFramed::new(tunnel.into_async());
+        let connector = build_connector(
+            config,
+            client_addr,
+            input_sender,
+            cliprdr_factory,
+            rdpdr_factory,
+            auto_reconnect_cookie,
+        )?;
+        return security_upgrade_and_finalize(framed, connector, config).await;
+    }
+
+    #[cfg(not(feature = "gateway-rpc"))]
+    if gw.rpc {
+        return Err(ironrdp_connector::general_err!(
+            "RPC-over-HTTP gateway (--gw-rpc) requires the `gateway-rpc` feature"
+        ));
+    }
+
     // Build the GwConnectTarget.  `server` is the RDP target derived from `config.destination`.
     // TODO: preserve the destination port; ironrdp-mstsgu may currently hard-code 3389.
     let gw_target = GwConnectTarget {
