@@ -203,3 +203,50 @@ fn connect_time_bandwidth_measure_stop_is_answered_and_phase_continues() {
         "the connector keeps listening after answering the bandwidth measurement"
     );
 }
+
+#[test]
+fn connect_time_bandwidth_measure_tallies_payload_across_the_window() {
+    use ironrdp_pdu::rdp::autodetect::{AutoDetectResponse, AutoDetectRspPdu};
+
+    let mut connector = connect_time_autodetect_connector();
+
+    let step = |connector: &mut ClientConnector, request: AutoDetectRequest| -> Vec<u8> {
+        let frame =
+            server_send_data_indication(MESSAGE_CHANNEL_ID, encode_vec(&AutoDetectReqPdu::new(request)).unwrap());
+        let mut output = WriteBuf::new();
+        connector.step(&frame, &mut output).unwrap();
+        output.filled().to_vec()
+    };
+
+    // Start opens the window; two payload bursts are tallied; none of these reply.
+    assert!(
+        step(&mut connector, AutoDetectRequest::bw_start_connect_time(0x11)).is_empty(),
+        "BW start produces no reply"
+    );
+    assert!(
+        step(&mut connector, AutoDetectRequest::bw_payload(0x11, vec![0u8; 700])).is_empty(),
+        "BW payload produces no reply"
+    );
+    assert!(
+        step(&mut connector, AutoDetectRequest::bw_payload(0x11, vec![0u8; 700])).is_empty(),
+        "BW payload produces no reply"
+    );
+
+    // Stop replies with Bandwidth Measure Results whose byteCount is the sum of the
+    // two payload bursts plus the stop's own payload.
+    let reply = step(
+        &mut connector,
+        AutoDetectRequest::bw_stop_connect_time(0x11, vec![0u8; 24]),
+    );
+    let mcs = ironrdp_core::decode::<X224<McsMessage<'_>>>(&reply).unwrap();
+    let McsMessage::SendDataRequest(send_data) = mcs.0 else {
+        panic!("expected SendDataRequest in the results reply");
+    };
+    let response = ironrdp_core::decode::<AutoDetectRspPdu>(&send_data.user_data).unwrap();
+    match response.response {
+        AutoDetectResponse::BandwidthMeasureResults { byte_count, .. } => {
+            assert_eq!(byte_count, 700 + 700 + 24, "byteCount must tally the whole window");
+        }
+        other => panic!("expected BandwidthMeasureResults, got {other:?}"),
+    }
+}
