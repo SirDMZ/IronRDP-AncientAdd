@@ -236,12 +236,10 @@ impl ClearCodecDecoder {
                     .vbar_cache
                     .get_short_vbar(*index)
                     .ok_or_else(|| invalid_field_err!("shortVbarIndex", "short V-bar cache miss on hit"))?;
-                if usize::from(*y_on) + usize::from(cached_short.pixel_count) > usize::from(band_height) {
-                    return Err(invalid_field_err!(
-                        "shortVBarYOn",
-                        "y_on + pixel_count exceeds band height"
-                    ));
-                }
+                // A fresh y_on paired with the cached run can make y_on + pixel_count
+                // exceed band_height; reconstruct_full_vbar clamps the column to the
+                // band (as FreeRDP does) rather than failing the decode, so no bounds
+                // check is needed here.
                 // Create a modified short vbar with the y_on from this reference
                 let modified = ShortVBar {
                     y_on: *y_on,
