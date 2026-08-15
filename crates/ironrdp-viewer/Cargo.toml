@@ -22,8 +22,12 @@ test = false
 
 [features]
 default = ["rustls", "sound"]
-rustls = ["ironrdp/rustls"]
-native-tls = ["ironrdp/native-tls"]
+rustls = ["ironrdp/rustls", "ironrdp-daemon/rustls"]
+# Pure-Rust rustls (RustCrypto provider). Build a C-toolchain-free viewer with
+# `--no-default-features --features rustls-rustcrypto` (drops audio's bundled libopus
+# and the aws-lc-rs crypto provider — no CMake/NASM required).
+rustls-rustcrypto = ["ironrdp/rustls-rustcrypto", "ironrdp-daemon/rustls-rustcrypto"]
+native-tls = ["ironrdp/native-tls", "ironrdp-daemon/native-tls"]
 # Audio output/input redirection. On by default, but it pulls in a bundled libopus
 # built via CMake; disable it (`--no-default-features --features rustls`) to build
 # without a CMake/C toolchain when audio is not needed.
@@ -32,7 +36,9 @@ qoi = ["ironrdp/qoi"]
 qoiz = ["ironrdp/qoiz"]
 
 [dependencies]
-ironrdp-daemon = { path = "../ironrdp-daemon", version = "0.1" } # public
+# `default-features = false` so the viewer's TLS-backend features drive the daemon's
+# backend (otherwise its default `rustls`/aws-lc-rs would always be pulled in).
+ironrdp-daemon = { path = "../ironrdp-daemon", version = "0.1", default-features = false } # public
 ironrdp-rpc = { path = "../ironrdp-rpc", version = "0.1" }
 # `client-all` minus `client-sound`, which is gated behind this crate's optional
 # `sound` feature above (audio pulls in a CMake-built libopus).
