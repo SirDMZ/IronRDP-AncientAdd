@@ -19,6 +19,8 @@ test = false
 [features]
 default = []
 rustls = ["ironrdp-tls/rustls", "tokio-tungstenite/rustls-tls-native-roots"]
+# Pure-Rust rustls (RustCrypto provider) — no CMake/NASM crypto build.
+rustls-rustcrypto = ["ironrdp-tls/rustls-rustcrypto", "tokio-tungstenite/rustls-tls-native-roots"]
 native-tls = ["ironrdp-tls/native-tls", "tokio-tungstenite/native-tls"]
 
 [dependencies]

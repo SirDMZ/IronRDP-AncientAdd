@@ -25,6 +25,15 @@ rustls = [
     "ironrdp-tsgu-rpc?/rustls",
 ]
 
+# Pure-Rust rustls backend (RustCrypto provider): same transports as `rustls`, but
+# no aws-lc-rs/ring, so no CMake/NASM/C toolchain is needed to build.
+rustls-rustcrypto = [
+    "ironrdp-tls/rustls-rustcrypto",
+    "tokio-tungstenite/rustls-tls-native-roots",
+    "ironrdp-mstsgu?/rustls-rustcrypto",
+    "ironrdp-tsgu-rpc?/rustls-rustcrypto",
+]
+
 native-tls = [
     "ironrdp-tls/native-tls",
     "tokio-tungstenite/native-tls",

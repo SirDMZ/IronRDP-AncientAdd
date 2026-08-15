@@ -29,6 +29,9 @@ default = [] # No default feature, the user must choose a TLS backend by enablin
 rustls = ["rustls-aws-lc-rs"]
 rustls-aws-lc-rs = ["rustls-no-provider", "tokio-rustls/aws_lc_rs"]
 rustls-ring = ["rustls-no-provider", "tokio-rustls/ring"]
+# Pure-Rust crypto provider (RustCrypto), installed as the rustls process default at
+# runtime. Compiles no C/asm crypto (no aws-lc-rs/ring), so it needs no CMake/NASM.
+rustls-rustcrypto = ["rustls-no-provider", "dep:rustls-rustcrypto"]
 # rustls backend without a bundled crypto provider: the downstream must install a
 # rustls CryptoProvider as the process default before opening a connection, otherwise
 # building the client configuration panics.
@@ -49,6 +52,9 @@ rustls-native-certs = { version = "0.8", optional = true }
 x509-cert = { version = "0.3", default-features = false, features = ["std"], optional = true } # public
 tokio-native-tls = { version = "0.3", optional = true } # public
 tokio-rustls = { version = "0.26", default-features = false, optional = true } # public
+# Default features keep `std`, `tls12` (RDP/CredSSP servers frequently negotiate
+# TLS 1.2), and `zeroize`.
+rustls-rustcrypto = { version = "0.0.2-alpha", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1.52", features = ["macros", "net", "rt"] }

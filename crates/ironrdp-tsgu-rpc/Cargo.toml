@@ -19,6 +19,8 @@ doctest = false
 default = []
 # A TLS backend must be selected (delegated to ironrdp-tls) to reach a gateway.
 rustls = ["ironrdp-tls/rustls"]
+# Pure-Rust rustls (RustCrypto provider) — no CMake/NASM crypto build.
+rustls-rustcrypto = ["ironrdp-tls/rustls-rustcrypto"]
 native-tls = ["ironrdp-tls/native-tls"]
 
 [dependencies]
