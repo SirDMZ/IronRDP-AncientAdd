@@ -97,10 +97,18 @@ impl VBarCache {
 
     /// Reconstruct a full V-bar from a short V-bar and background color.
     ///
-    /// The full V-bar has:
-    /// - Background color above y_on
-    /// - Short V-bar pixel data from y_on to y_on + pixel_count
-    /// - Background color below y_on + pixel_count
+    /// The full V-bar is exactly `band_height` rows:
+    /// - Background color above `y_on`
+    /// - Short V-bar pixel data from `y_on`
+    /// - Background color filling the remainder of the band
+    ///
+    /// Everything is clamped to `band_height` (matching FreeRDP's `clear.c`). A
+    /// SHORT_VBAR_CACHE_HIT supplies a fresh, unvalidated `y_on` paired with a
+    /// *cached* short-pixel run, so `y_on + pixel_count` can exceed the current band
+    /// height. Without the clamp the reconstructed column is too tall: its blit
+    /// writes past the band into the rows below (same column), and the oversized
+    /// column poisons the full-V-bar cache for later hits. The clamp guarantees the
+    /// column is exactly `band_height` rows in every case.
     pub fn reconstruct_full_vbar(
         short_vbar: &ShortVBar,
         band_height: u16,
@@ -109,21 +117,25 @@ impl VBarCache {
         bg_red: u8,
     ) -> FullVBar {
         let height = usize::from(band_height);
+        let y_on = usize::from(short_vbar.y_on).min(height);
+        let avail = height - y_on;
+        let short_rows = usize::from(short_vbar.pixel_count)
+            .min(avail)
+            .min(short_vbar.pixels.len() / 3);
         let mut pixels = Vec::with_capacity(height * 3);
 
-        // Background above y_on
-        for _ in 0..usize::from(short_vbar.y_on) {
+        // Background above y_on.
+        for _ in 0..y_on {
             pixels.push(bg_blue);
             pixels.push(bg_green);
             pixels.push(bg_red);
         }
 
-        // Pixel data from short V-bar
-        pixels.extend_from_slice(&short_vbar.pixels);
+        // Short V-bar pixel data (BGR), clamped so it cannot overflow the band.
+        pixels.extend_from_slice(&short_vbar.pixels[..short_rows * 3]);
 
-        // Background below y_on + pixel_count
-        let bottom_start = usize::from(short_vbar.y_on) + usize::from(short_vbar.pixel_count);
-        for _ in bottom_start..height {
+        // Background below, filling the remainder of the band exactly.
+        for _ in (y_on + short_rows)..height {
             pixels.push(bg_blue);
             pixels.push(bg_green);
             pixels.push(bg_red);
@@ -186,6 +198,27 @@ mod tests {
         assert_eq!(&full.pixels[3..9], &[0xFF, 0x00, 0x00, 0x00, 0xFF, 0x00]);
         // Row 3: background
         assert_eq!(&full.pixels[9..12], &[0xAA, 0xBB, 0xCC]);
+    }
+
+    #[test]
+    fn reconstruct_full_vbar_clamps_to_band_height() {
+        // A SHORT_VBAR_CACHE_HIT pairs a fresh y_on with a cached short-pixel run,
+        // so y_on + pixel_count can exceed the band height. The reconstructed column
+        // must stay exactly band_height rows rather than overflow into the band below.
+        let short = ShortVBar {
+            y_on: 3,
+            pixel_count: 4, // wants rows 3..7, but the band is only 5 tall
+            pixels: vec![0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC],
+        };
+        let full = VBarCache::reconstruct_full_vbar(&short, 5, 0x01, 0x02, 0x03);
+        assert_eq!(full.pixels.len(), 5 * 3, "column must be exactly band_height rows");
+        // Rows 0-2: background (y_on = 3).
+        assert_eq!(
+            &full.pixels[0..9],
+            &[0x01, 0x02, 0x03, 0x01, 0x02, 0x03, 0x01, 0x02, 0x03]
+        );
+        // Rows 3-4: only the first 2 short pixels fit (band_height - y_on = 2).
+        assert_eq!(&full.pixels[9..15], &[0x11, 0x22, 0x33, 0x44, 0x55, 0x66]);
     }
 
     #[test]

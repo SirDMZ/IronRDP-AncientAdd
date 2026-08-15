@@ -12,8 +12,19 @@ authors.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[features]
+# TLS backend, forwarded to ironrdp-client. Defaults to `rustls` (aws-lc-rs) to
+# preserve the previous always-on behavior for standalone consumers; a downstream
+# that wants a C-free build depends on this crate with `default-features = false`
+# and selects `rustls-rustcrypto` (or `native-tls`) instead.
+default = ["rustls"]
+rustls = ["ironrdp-client/rustls"]
+rustls-rustcrypto = ["ironrdp-client/rustls-rustcrypto"]
+native-tls = ["ironrdp-client/native-tls"]
+
 [dependencies]
-ironrdp-client = { path = "../ironrdp-client", version = "0.1", features = ["rustls", "dvc-pipe-proxy", "rdpdr", "smartcard"] } # public
+# TLS backend is chosen via this crate's own features above, not hardcoded here.
+ironrdp-client = { path = "../ironrdp-client", version = "0.1", features = ["dvc-pipe-proxy", "rdpdr", "smartcard"] } # public
 ironrdp-cfg = { path = "../ironrdp-cfg", version = "0.1" }
 ironrdp-input = { path = "../ironrdp-input", version = "0.7" }
 ironrdp-pdu = { path = "../ironrdp-pdu", version = "0.9" }

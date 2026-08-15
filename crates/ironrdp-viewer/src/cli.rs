@@ -76,6 +76,19 @@ struct Args {
     gw_user: Option<String>,
     #[clap(long, value_parser)]
     gw_pass: Option<String>,
+    /// Domain for the gateway account's NTLM auth (independent of the target `-d`
+    /// domain). Some RD Gateways require `DOMAIN\user`; supply the domain here.
+    #[clap(long, value_parser)]
+    gw_domain: Option<String>,
+    /// Use the RPC-over-HTTP gateway transport (MS-TSGU over MS-RPCH) instead of the
+    /// default WebSocket transport. Requires `--gw-endpoint` and the `gateway-rpc` feature.
+    #[clap(long = "gw-rpc", requires = "gw_endpoint")]
+    gw_rpc: bool,
+
+    /// Progressive (RemoteFX) TILE_UPGRADE decode variant, for A/B testing image
+    /// quality against a server: 1 = baseline (default), 2 = threaded SRL reader.
+    #[clap(long = "graphics-upgrade", value_parser = clap::value_parser!(u8).range(1..=2), default_value_t = 1)]
+    graphics_upgrade: u8,
 
     /// An address on which the client will connect.
     #[clap(env = "RDP_HOSTNAME")]
@@ -280,6 +293,11 @@ impl ViewerConfig {
     {
         let args = Args::parse_from(args);
 
+        // Process-global codec knob: select the progressive TILE_UPGRADE decode
+        // variant before any surface is decoded. Set here (ahead of the transport
+        // branches below) so it applies on every path, including `--rpc`.
+        ironrdp::graphics::progressive::set_upgrade_variant(args.graphics_upgrade);
+
         let mut properties = ironrdp_propertyset::PropertySet::new();
 
         if let Some(rdp_file) = &args.rdp_file {
@@ -455,6 +473,10 @@ fn apply_cli_to_builder(
         if let Some(password) = args.gw_pass {
             builder = builder.with_gateway_password(password);
         }
+        if let Some(gw_domain) = args.gw_domain {
+            builder = builder.with_gateway_domain(gw_domain);
+        }
+        builder = builder.with_gateway_rpc(args.gw_rpc);
     }
 
     builder = builder.with_clipboard(resolve_clipboard_type(args.clipboard_type, redirect_clipboard));

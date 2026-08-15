@@ -38,6 +38,7 @@ const CANONICAL_SCOPES: &[&str] = &[
     "rdcleanpath",
     "tls",
     "mstsgu",
+    "tsgu-rpc",
     "vmconnect",
     "client",
     "viewer",

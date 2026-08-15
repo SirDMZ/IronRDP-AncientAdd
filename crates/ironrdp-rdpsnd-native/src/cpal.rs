@@ -368,7 +368,18 @@ pub struct DecodeStream {
 }
 
 impl DecodeStream {
-    pub fn new(rx_format: &AudioFormat, mut rx: Receiver<Vec<u8>>, volume: Arc<AtomicU32>) -> RdpsndNativeResult<Self> {
+    pub fn new(rx_format: &AudioFormat, rx: Receiver<Vec<u8>>, volume: Arc<AtomicU32>) -> RdpsndNativeResult<Self> {
+        // `rx` and `dec_thread` are reassigned only by the Opus branch below. Without the
+        // `opus` feature that branch is compiled out, so the bindings are never mutated.
+        #[cfg_attr(
+            not(feature = "opus"),
+            expect(unused_mut, reason = "reassigned only by the `opus`-gated decode branch")
+        )]
+        let mut rx = rx;
+        #[cfg_attr(
+            not(feature = "opus"),
+            expect(unused_mut, reason = "assigned only by the `opus`-gated decode branch")
+        )]
         let mut dec_thread = None;
         match rx_format.format {
             #[cfg(feature = "opus")]

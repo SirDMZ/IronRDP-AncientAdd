@@ -1,0 +1,42 @@
+[package]
+name = "ironrdp-tsgu-rpc"
+version = "0.0.1"
+readme = "README.md"
+description = "Microsoft RD Gateway (MS-TSGU) client over the RPC-over-HTTP (MS-RPCH) transport"
+edition.workspace = true
+rust-version = "1.94"
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lib]
+doctest = false
+
+[features]
+default = []
+# A TLS backend must be selected (delegated to ironrdp-tls) to reach a gateway.
+rustls = ["ironrdp-tls/rustls"]
+# Pure-Rust rustls (RustCrypto provider) — no CMake/NASM crypto build.
+rustls-rustcrypto = ["ironrdp-tls/rustls-rustcrypto"]
+native-tls = ["ironrdp-tls/native-tls"]
+
+[dependencies]
+ironrdp-tls = { path = "../ironrdp-tls", version = "0.2" }
+tokio = { version = "1.52", features = ["net", "io-util", "rt", "macros", "time", "sync"] }
+sspi = { version = "0.21", default-features = false }
+base64 = "0.22"
+getrandom = "0.4"
+sha2 = "0.10"
+x509-cert = { version = "0.3", default-features = false, features = ["std"] }
+tracing = "0.1"
+thiserror = "2"
+
+# The delayed-ACK defeat on the gateway channels uses TCP_QUICKACK via setsockopt.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[lints]
+workspace = true

@@ -252,6 +252,12 @@ pub struct ClientConnector {
     ///
     /// Set via [`ClientConnector::with_auto_reconnect_cookie`].
     pub auto_reconnect_cookie: Option<ServerAutoReconnect>,
+    /// Connect-time network auto-detect ([MS-RDPBCGR] 2.2.14) bandwidth-measurement
+    /// scratch state: the instant the current Bandwidth Measure Start was received
+    /// and the bytes tallied since, used to compute the timeDelta/byteCount reported
+    /// in the Bandwidth Measure Results. `None`/`0` when no measurement is in flight.
+    pub bw_measure_start: Option<std::time::Instant>,
+    pub bw_measure_bytes: u32,
 }
 
 impl ClientConnector {
@@ -264,6 +270,8 @@ impl ClientConnector {
             message_channel_id: None,
             server_multitransport_flags: None,
             auto_reconnect_cookie: None,
+            bw_measure_start: None,
+            bw_measure_bytes: 0,
         }
     }
 
@@ -1023,6 +1031,8 @@ impl Sequence for ClientConnector {
                             autodetect.request,
                             message_channel_id,
                             user_channel_id,
+                            &mut self.bw_measure_start,
+                            &mut self.bw_measure_bytes,
                             output,
                         )?;
                         (
@@ -1315,6 +1325,8 @@ fn respond_to_connect_time_autodetect(
     request: rdp::autodetect::AutoDetectRequest,
     message_channel_id: u16,
     user_channel_id: u16,
+    bw_measure_start: &mut Option<std::time::Instant>,
+    bw_measure_bytes: &mut u32,
     output: &mut WriteBuf,
 ) -> ConnectorResult<Written> {
     use ironrdp_pdu::rdp::autodetect::{
@@ -1327,34 +1339,53 @@ fn respond_to_connect_time_autodetect(
             let written = encode_send_data_request(user_channel_id, message_channel_id, &response, output)?;
             Written::from_size(written)
         }
-        // A connect-time Bandwidth Measure Stop ([MS-RDPBCGR] 2.2.14.1.4) warrants a
-        // Bandwidth Measure Results reply ([MS-RDPBCGR] 2.2.14.2.2). This reply must
-        // be sent: FreeRDP-based servers (for example GNOME Remote Desktop) block in
-        // their AWAIT_BW_RESULT state until they receive it and never proceed to
-        // licensing without it, so omitting it stalls the whole connection. We do not
-        // run a stateful connect-time measurement, so we report the payload the
-        // server handed us over a nominal interval; the figure is an informational
-        // QoS hint and the server proceeds on receipt. A precise measurement (timing
-        // the Start/Payload/Stop window) can refine the reported bandwidth later.
+        // Connect-time bandwidth measurement ([MS-RDPBCGR] 2.2.14.1.2-4). The server
+        // brackets a burst of random BW_PAYLOAD data between a Bandwidth Measure Start
+        // and Stop; time the interval and tally the bytes, then reply to the Stop with
+        // a Bandwidth Measure Results PDU ([MS-RDPBCGR] 2.2.14.2.2) so the server learns
+        // the link throughput. Mirrors FreeRDP's autodetect_recv_bandwidth_measure_*.
+        //
+        // The reply is not optional: FreeRDP-based servers (for example GNOME Remote
+        // Desktop) block in AWAIT_BW_RESULT until they receive it and never proceed to
+        // licensing without it, so omitting it stalls the whole connection.
+        AutoDetectRequest::BandwidthMeasureStart { .. } => {
+            *bw_measure_start = Some(std::time::Instant::now());
+            *bw_measure_bytes = 0;
+            debug!("Connect-time bandwidth measure started");
+            Ok(Written::Nothing)
+        }
+        AutoDetectRequest::BandwidthMeasurePayload { payload, .. } => {
+            *bw_measure_bytes = bw_measure_bytes.saturating_add(u32::try_from(payload.len()).unwrap_or(u32::MAX));
+            Ok(Written::Nothing)
+        }
         AutoDetectRequest::BandwidthMeasureStop {
             sequence_number,
             payload,
             ..
         } => {
-            let byte_count = payload
-                .as_ref()
-                .map_or(0, |p| u32::try_from(p.len()).unwrap_or(u32::MAX));
+            if let Some(bytes) = payload {
+                *bw_measure_bytes = bw_measure_bytes.saturating_add(u32::try_from(bytes.len()).unwrap_or(u32::MAX));
+            }
+            let time_delta_ms = bw_measure_start
+                .take()
+                .map(|start| u32::try_from(start.elapsed().as_millis()).unwrap_or(u32::MAX))
+                .unwrap_or(0);
+            debug!(
+                time_delta_ms,
+                byte_count = *bw_measure_bytes,
+                "Sent connect-time bandwidth results"
+            );
             let response = AutoDetectRspPdu::new(AutoDetectResponse::BandwidthMeasureResults {
                 sequence_number,
                 response_type: BW_RESULTS_CONNECT_TIME,
-                time_delta_ms: 1,
-                byte_count,
+                time_delta_ms,
+                byte_count: *bw_measure_bytes,
             });
             let written = encode_send_data_request(user_channel_id, message_channel_id, &response, output)?;
             Written::from_size(written)
         }
-        // Bandwidth Measure Start and Payload carry no client reply, and the Network
-        // Characteristics Result is informational; nothing to send for those.
+        // The Network Characteristics Result ([MS-RDPBCGR] 2.2.14.1.5) is the server
+        // reporting its computed numbers back to us; it is informational, no reply.
         _ => Ok(Written::Nothing),
     }
 }
@@ -1424,6 +1455,13 @@ fn create_gcc_blocks<'a>(
                         | ClientEarlyCapabilityFlags::SUPPORT_ERR_INFO_PDU
                         | ClientEarlyCapabilityFlags::STRONG_ASYMMETRIC_KEYS
                         | ClientEarlyCapabilityFlags::SUPPORT_NET_CHAR_AUTODETECT
+                        // Announce participation in the monitor-layout / dynamic-display
+                        // feature. A Windows RDS host opens the DisplayControl DVC
+                        // (MS-RDPEDISP) — which the client registers — only for a client
+                        // that advertises this flag. The server may then send a Monitor
+                        // Layout PDU during finalization, handled in
+                        // connection_finalization.rs.
+                        | ClientEarlyCapabilityFlags::SUPPORT_MONITOR_LAYOUT_PDU
                         | ClientEarlyCapabilityFlags::SUPPORT_SKIP_CHANNELJOIN;
 
                     // TODO(#136): support for ClientEarlyCapabilityFlags::SUPPORT_STATUS_INFO_PDU
@@ -1463,7 +1501,19 @@ fn create_gcc_blocks<'a>(
         },
         // TODO(#139): support for Some(ClientClusterData { flags: RedirectionFlags::REDIRECTION_SUPPORTED, redirection_version: RedirectionVersion::V4, redirected_session_id: 0, }),
         cluster: None,
-        monitor: None,
+        // Advertise a single primary monitor covering the desktop. mstsc/FreeRDP send
+        // a monitor layout; a Windows RDS host can otherwise lack the display geometry
+        // it needs. The monitor's bounding box matches `desktop_size` (right/bottom are
+        // inclusive, hence the -1).
+        monitor: Some(gcc::ClientMonitorData {
+            monitors: vec![gcc::Monitor {
+                left: 0,
+                top: 0,
+                right: i32::from(config.desktop_size.width).saturating_sub(1),
+                bottom: i32::from(config.desktop_size.height).saturating_sub(1),
+                flags: gcc::MonitorFlags::PRIMARY,
+            }],
+        }),
         // Request the MCS message channel, which carries network auto-detect
         // ([MS-RDPBCGR] 2.2.14) and the multitransport / heartbeat PDUs. The
         // server assigns its ID in Server Message Channel Data.

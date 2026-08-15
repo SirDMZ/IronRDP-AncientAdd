@@ -245,6 +245,18 @@ impl Sequence for ConnectionFinalizationSequence {
                             }
                         }
                     }
+                    ShareDataPdu::MonitorLayout(_) => {
+                        // https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/6848d41f-b044-47b4-88ee-65c4db62dd8d
+                        //
+                        // The server sends the Monitor Layout PDU during finalization when
+                        // the client advertised SUPPORT_MONITOR_LAYOUT_PDU (which we do, so
+                        // the host opens the DisplayControl DVC). It is informational — the
+                        // monitor layout the server adopted — and requires no response, so
+                        // ignore it and keep waiting for the Font Map PDU that ends
+                        // finalization.
+                        debug!("Server Monitor Layout");
+                        ConnectionFinalizationState::WaitForResponse
+                    }
                     ShareDataPdu::FontMap(_) => {
                         // https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/023f1e69-cfe8-4ee6-9ee0-7e759fb4e4ee
                         //

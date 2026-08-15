@@ -10,6 +10,25 @@ use crate::{CertificateValidation, CertificateValidationCallback};
 
 pub type TlsStream<S> = tokio_rustls::client::TlsStream<S>;
 
+/// Install the pure-Rust RustCrypto crypto provider as the process-wide rustls
+/// default, exactly once.
+///
+/// The `rustls-rustcrypto` backend builds on `rustls-no-provider` (no crypto
+/// provider is compiled into rustls), so `ClientConfig::builder()` — which reads
+/// the process default — needs one installed first. Doing it here means callers get
+/// a working pure-Rust TLS stack without having to install a provider themselves.
+#[cfg(feature = "rustls-rustcrypto")]
+fn ensure_default_crypto_provider() {
+    use std::sync::Once;
+
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| {
+        // An `Err` means a default is already installed (e.g. a bundled provider some
+        // other crate pulled in); either way a usable default exists afterwards.
+        let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
+    });
+}
+
 pub async fn upgrade<S>(stream: S, server_name: &str) -> io::Result<(TlsStream<S>, x509_cert::Certificate)>
 where
     S: Unpin + AsyncRead + AsyncWrite,
@@ -28,6 +47,9 @@ pub async fn upgrade_with_certificate_validation<S>(
 where
     S: Unpin + AsyncRead + AsyncWrite,
 {
+    #[cfg(feature = "rustls-rustcrypto")]
+    ensure_default_crypto_provider();
+
     let mut tls_stream = {
         let mut config = match certificate_validation {
             CertificateValidation::Strict => rustls::client::ClientConfig::builder()
@@ -87,6 +109,9 @@ pub async fn upgrade_with_certificate_validation_callback<S>(
 where
     S: Unpin + AsyncRead + AsyncWrite,
 {
+    #[cfg(feature = "rustls-rustcrypto")]
+    ensure_default_crypto_provider();
+
     let verifier = rustls::client::WebPkiServerVerifier::builder(Arc::new(platform_root_certificates()?))
         .build()
         .map_err(io::Error::other)?;

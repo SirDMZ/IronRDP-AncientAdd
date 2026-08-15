@@ -21,16 +21,46 @@ name = "ironrdp-viewer"
 test = false
 
 [features]
-default = ["rustls"]
-rustls = ["ironrdp/rustls"]
-native-tls = ["ironrdp/native-tls"]
+default = ["rustls", "sound"]
+rustls = ["ironrdp/rustls", "ironrdp-daemon/rustls"]
+# Pure-Rust rustls (RustCrypto provider). Build a C-toolchain-free viewer with
+# `--no-default-features --features rustls-rustcrypto` (drops audio's bundled libopus
+# and the aws-lc-rs crypto provider — no CMake/NASM required).
+rustls-rustcrypto = ["ironrdp/rustls-rustcrypto", "ironrdp-daemon/rustls-rustcrypto"]
+native-tls = ["ironrdp/native-tls", "ironrdp-daemon/native-tls"]
+# Audio output/input redirection. PCM-only via cpal, so it needs no CMake/C toolchain
+# (WASAPI on Windows, CoreAudio on macOS, system ALSA on Linux). On by default.
+sound = ["ironrdp/client-sound"]
+# Add Opus to audio (bandwidth saving) — pulls a CMake-built libopus, reintroducing the
+# C-toolchain build requirement. Opt-in on top of `sound`.
+sound-opus = ["sound", "ironrdp/client-sound-opus"]
 qoi = ["ironrdp/qoi"]
 qoiz = ["ironrdp/qoiz"]
 
 [dependencies]
-ironrdp-daemon = { path = "../ironrdp-daemon", version = "0.1" } # public
+# `default-features = false` so the viewer's TLS-backend features drive the daemon's
+# backend (otherwise its default `rustls`/aws-lc-rs would always be pulled in).
+ironrdp-daemon = { path = "../ironrdp-daemon", version = "0.1", default-features = false } # public
 ironrdp-rpc = { path = "../ironrdp-rpc", version = "0.1" }
-ironrdp = { path = "../ironrdp", version = "0.17", features = ["connector", "cliprdr", "input", "pdu", "client", "client-all", "client-vmconnect"] }
+# `client-all` minus `client-sound`, which is gated behind this crate's optional
+# `sound` feature above (audio pulls in a CMake-built libopus).
+ironrdp = { path = "../ironrdp", version = "0.17", features = [
+    "connector",
+    "cliprdr",
+    "input",
+    "pdu",
+    "graphics",
+    "client",
+    "client-clipboard",
+    "client-rdpdr",
+    "client-smartcard",
+    "client-gateway",
+    "client-gateway-rpc",
+    "client-dvc-pipe-proxy",
+    "client-dvc-com-plugin",
+    "client-webauthn",
+    "client-vmconnect",
+] }
 ironrdp-cfg = { path = "../ironrdp-cfg", version = "0.1" }
 ironrdp-propertyset = { path = "../ironrdp-propertyset", version = "0.1" }
 ironrdp-rdpfile = { path = "../ironrdp-rdpfile", version = "0.1" }

@@ -36,6 +36,7 @@ extern crate alloc;
 
 use alloc::collections::BTreeMap;
 use alloc::collections::btree_map::Entry;
+use core::sync::atomic::{AtomicU8, Ordering};
 
 use ironrdp_pdu::codecs::rfx::EntropyAlgorithm;
 use ironrdp_pdu::codecs::rfx::progressive::ComponentCodecQuant;
@@ -59,6 +60,43 @@ pub const NUM_BANDS: usize = 10;
 pub const SIGN_ZERO: i8 = 0;
 pub const SIGN_POSITIVE: i8 = 1;
 pub const SIGN_NEGATIVE: i8 = -1;
+
+// ---------------------------------------------------------------------------
+// Runtime-selectable TILE_UPGRADE decode variant
+// ---------------------------------------------------------------------------
+
+/// Process-global selector for the progressive TILE_UPGRADE decode strategy.
+/// Defaults to `1` (the original behavior). See [`set_upgrade_variant`].
+static UPGRADE_VARIANT: AtomicU8 = AtomicU8::new(1);
+
+/// Select the progressive TILE_UPGRADE decode variant process-wide.
+///
+/// Two variants exist so a client can be compared against a real RDP server
+/// without recompiling:
+///   1. **baseline** — the per-band decode: a fresh SRL ([`srl::decode_srl`]) and
+///      raw-bit reader per subband, a `curr_bit_pos` refine shift, overwrite on a
+///      zero→non-zero coefficient, and LL3 routed through SRL. Matches the current
+///      upstream `ironrdp-graphics` base-quantization pipeline.
+///   2. **threaded SRL** — one [`srl::SrlReader`] (kp=8, truncated-unary) and one
+///      raw-bit reader threaded across all ten subbands, but otherwise variant 1's
+///      refinement math. Isolates the shared-stream fix for servers where the
+///      per-band SRL restart would corrupt refinements after the first subband.
+///
+/// A third, `base_q`-coupled variant was removed: its refine shift assumed the
+/// pre-0.9.0 `(base_q - 1)` base-dequantization convention and is incompatible with
+/// the current 6-pivot dequantization (see CHANGELOG).
+///
+/// Values outside `1..=2` are clamped into range. This is a runtime diagnostic
+/// knob; the default of `1` preserves the previous behavior byte-for-byte.
+pub fn set_upgrade_variant(variant: u8) {
+    UPGRADE_VARIANT.store(variant.clamp(1, 2), Ordering::Relaxed);
+}
+
+/// The progressive TILE_UPGRADE decode variant currently selected (`1..=2`).
+#[must_use]
+pub fn upgrade_variant() -> u8 {
+    UPGRADE_VARIANT.load(Ordering::Relaxed)
+}
 
 // ---------------------------------------------------------------------------
 // First-pass decode (TILE_SIMPLE / TILE_FIRST)
@@ -131,7 +169,8 @@ fn decode_first_pass_to_dwtq(
 
 /// Decode an upgrade-pass component from SRL and raw data streams.
 ///
-/// For each coefficient position:
+/// Dispatches to one of two decode variants selected by [`set_upgrade_variant`]
+/// (default variant 1). For each coefficient position:
 /// - DAS = 0 (zero): decode from SRL stream, update DAS if non-zero
 /// - DAS != 0 (non-zero): decode raw magnitude bits, accumulate
 ///
@@ -159,6 +198,41 @@ pub fn decode_upgrade_pass(
     assert!(coefficients.len() >= COEFFICIENTS_PER_COMPONENT);
     assert!(sign.len() >= COEFFICIENTS_PER_COMPONENT);
 
+    match upgrade_variant() {
+        2 => decode_upgrade_pass_v2(
+            srl_data,
+            raw_data,
+            prev_prog_quant,
+            curr_prog_quant,
+            use_reduce_extrapolate,
+            coefficients,
+            sign,
+        ),
+        _ => decode_upgrade_pass_v1(
+            srl_data,
+            raw_data,
+            prev_prog_quant,
+            curr_prog_quant,
+            use_reduce_extrapolate,
+            coefficients,
+            sign,
+        ),
+    }
+}
+
+/// **Variant 1 (baseline).** A fresh SRL decode ([`srl::decode_srl`]) and a fresh
+/// raw-bit reader per subband, a `curr_bit_pos` refine shift, overwrite on a
+/// zero→non-zero coefficient, and LL3 routed through SRL. This is the original
+/// behavior, preserved byte-for-byte.
+fn decode_upgrade_pass_v1(
+    srl_data: &[u8],
+    raw_data: &[u8],
+    prev_prog_quant: &ComponentCodecQuant,
+    curr_prog_quant: &ComponentCodecQuant,
+    use_reduce_extrapolate: bool,
+    coefficients: &mut [i16],
+    sign: &mut [i8],
+) {
     let bands = get_band_layout(use_reduce_extrapolate);
 
     for (band_idx, band) in bands.iter().enumerate() {
@@ -174,7 +248,7 @@ pub fn decode_upgrade_pass(
         // Count zero-DAS positions in this band (for SRL decode)
         let zero_count = band_zero_count(sign, band);
 
-        // SRL decode for zero-DAS positions
+        // SRL decode for zero-DAS positions (fresh per band)
         let srl_values = srl::decode_srl(srl_data, zero_count, num_bits);
 
         // Apply upgrade values to this band
@@ -213,6 +287,66 @@ pub fn decode_upgrade_pass(
                         coefficients[coeff_idx] = clamp_i16(i32::from(coefficients[coeff_idx]) + shifted);
                     } else {
                         // Negative DAS subtracts
+                        coefficients[coeff_idx] = clamp_i16(i32::from(coefficients[coeff_idx]) - shifted);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// **Variant 2 (threaded SRL).** Variant 1's refinement math, but with one
+/// [`srl::SrlReader`] (kp=8, truncated-unary) and one [`RawBitReader`] threaded
+/// across all ten subbands instead of restarted per band. Isolates the
+/// shared-stream fix from the refinement-math changes in variant 3.
+fn decode_upgrade_pass_v2(
+    srl_data: &[u8],
+    raw_data: &[u8],
+    prev_prog_quant: &ComponentCodecQuant,
+    curr_prog_quant: &ComponentCodecQuant,
+    use_reduce_extrapolate: bool,
+    coefficients: &mut [i16],
+    sign: &mut [i8],
+) {
+    let bands = get_band_layout(use_reduce_extrapolate);
+
+    // One SRL reader and one raw-bit reader for the whole component, threaded
+    // across every band (see [`srl::SrlReader`]).
+    let mut srl = srl::SrlReader::new(srl_data);
+    let mut raw_reader = RawBitReader::new(raw_data);
+
+    for (band_idx, band) in bands.iter().enumerate() {
+        let prev_bit_pos = prev_prog_quant.for_band(band_idx);
+        let curr_bit_pos = curr_prog_quant.for_band(band_idx);
+
+        let num_bits = prev_bit_pos.saturating_sub(curr_bit_pos);
+        if num_bits == 0 {
+            continue;
+        }
+
+        let is_ll3 = band_idx == 9;
+
+        for i in 0..band.count() {
+            let coeff_idx = band.offset + i;
+
+            if sign[coeff_idx] == SIGN_ZERO {
+                // Zero-DAS: pull one value from the shared SRL stream.
+                let value = srl.next_value(num_bits);
+
+                if value != 0 {
+                    let shifted = i32::from(value) << i32::from(curr_bit_pos);
+                    coefficients[coeff_idx] = clamp_i16(shifted);
+                    sign[coeff_idx] = if value > 0 { SIGN_POSITIVE } else { SIGN_NEGATIVE };
+                }
+            } else {
+                let raw_mag = raw_reader.read_bits(u32::from(num_bits));
+
+                if raw_mag != 0 {
+                    let mag_i32 = i32::try_from(raw_mag).unwrap_or(i32::MAX);
+                    let shifted = mag_i32 << i32::from(curr_bit_pos);
+                    if is_ll3 || sign[coeff_idx] == SIGN_POSITIVE {
+                        coefficients[coeff_idx] = clamp_i16(i32::from(coefficients[coeff_idx]) + shifted);
+                    } else {
                         coefficients[coeff_idx] = clamp_i16(i32::from(coefficients[coeff_idx]) - shifted);
                     }
                 }
@@ -1244,6 +1378,31 @@ impl ProgressiveDecoder {
     }
 }
 
+/// Select the progressive-quant values for a tile's `quality` byte.
+///
+/// `quality == 0xFF` is the RFX Progressive full-quality/lossless sentinel, not an
+/// index into the region progressive-quant table: a frame coded that way carries an
+/// empty table (`numProgQuant == 0`), so it must map to
+/// [`ComponentCodecQuant::LOSSLESS`] rather than index the table (which would fail
+/// with `InvalidQuantIndex`). Any other value indexes the table, bounds-checked as
+/// before. Mirrors FreeRDP's `quantProgValFull` handling in `progressive.c`.
+fn select_prog_quant(
+    quality: u8,
+    prog_quant_vals: &[ironrdp_pdu::codecs::rfx::progressive::ProgressiveCodecQuant],
+) -> Result<[ComponentCodecQuant; 3], ProgressiveDecodeError> {
+    if quality == 0xFF {
+        return Ok([ComponentCodecQuant::LOSSLESS; 3]);
+    }
+    let idx = usize::from(quality);
+    let pq = prog_quant_vals
+        .get(idx)
+        .ok_or(ProgressiveDecodeError::InvalidQuantIndex {
+            index: idx,
+            table_len: prog_quant_vals.len(),
+        })?;
+    Ok([pq.y_quant, pq.cb_quant, pq.cr_quant])
+}
+
 #[expect(
     clippy::similar_names,
     reason = "q_y/q_cb/q_cr are standard component quant index names"
@@ -1314,19 +1473,12 @@ fn decode_tile_block(
                 });
             }
 
-            let pq_idx = usize::from(tile.quality);
-            if pq_idx >= prog_quant_vals.len() {
-                return Err(ProgressiveDecodeError::InvalidQuantIndex {
-                    index: pq_idx,
-                    table_len: prog_quant_vals.len(),
-                });
-            }
-            let pq = &prog_quant_vals[pq_idx];
+            let prog = select_prog_quant(tile.quality, prog_quant_vals)?;
 
             tile_state.decode_first(
                 [tile.y_data, tile.cb_data, tile.cr_data],
                 [&quant_vals[q_y], &quant_vals[q_cb], &quant_vals[q_cr]],
-                [pq.y_quant, pq.cb_quant, pq.cr_quant],
+                prog,
                 [tile.quant_idx_y, tile.quant_idx_cb, tile.quant_idx_cr],
                 tile.quality,
                 use_reduce_extrapolate,
@@ -1351,19 +1503,12 @@ fn decode_tile_block(
                 return Ok(Vec::new());
             }
 
-            let pq_idx = usize::from(tile.quality);
-            if pq_idx >= prog_quant_vals.len() {
-                return Err(ProgressiveDecodeError::InvalidQuantIndex {
-                    index: pq_idx,
-                    table_len: prog_quant_vals.len(),
-                });
-            }
-            let pq = &prog_quant_vals[pq_idx];
+            let prog = select_prog_quant(tile.quality, prog_quant_vals)?;
 
             tile_state.decode_upgrade(
                 [tile.y_srl_data, tile.cb_srl_data, tile.cr_srl_data],
                 [tile.y_raw_data, tile.cb_raw_data, tile.cr_raw_data],
-                [pq.y_quant, pq.cb_quant, pq.cr_quant],
+                prog,
                 tile.quality,
             );
 
@@ -1389,6 +1534,31 @@ impl Default for ProgressiveDecoder {
 #[expect(clippy::as_conversions, clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prog_quant_sentinel_0xff_is_lossless_without_table() {
+        // quality == 0xFF is the full-quality/lossless sentinel: it must map to
+        // LOSSLESS even when the region carries no progressive-quant table
+        // (numProgQuant == 0), rather than index the empty table and fail.
+        let got = select_prog_quant(0xFF, &[]).unwrap();
+        assert_eq!(got, [ComponentCodecQuant::LOSSLESS; 3]);
+    }
+
+    #[test]
+    fn prog_quant_non_sentinel_indexes_and_bounds_checks() {
+        use ironrdp_pdu::codecs::rfx::progressive::ProgressiveCodecQuant;
+        let table = [ProgressiveCodecQuant {
+            quality: 0,
+            y_quant: ComponentCodecQuant::LOSSLESS,
+            cb_quant: ComponentCodecQuant::LOSSLESS,
+            cr_quant: ComponentCodecQuant::LOSSLESS,
+        }];
+        assert!(select_prog_quant(0, &table).is_ok());
+        assert!(matches!(
+            select_prog_quant(1, &table),
+            Err(ProgressiveDecodeError::InvalidQuantIndex { index: 1, table_len: 1 })
+        ));
+    }
 
     #[test]
     fn surface_tiles_rejects_over_cap_dimensions() {
@@ -1619,6 +1789,69 @@ mod tests {
 
         // After decode, at least some positions should have been updated
         // (exact values depend on SRL interpretation, but the function shouldn't panic)
+    }
+
+    // `SrlReader` on the single byte 0b1001_1001 yields [+1, +2] for num_bits=2
+    // (verified in `srl` unit tests): '1001' -> escape, no remainder zeros, sign +,
+    // truncated-unary magnitude 1; then '1001' again -> magnitude 2. The two
+    // threading tests below place exactly one zero-DAS coefficient in each of the
+    // first two refined bands, so the shared SRL stream must deliver +1 to band 0
+    // and +2 to band 1. A per-band restart would re-read +1 for band 1.
+    const SRL_TWO_VALUES_PLUS1_PLUS2: [u8; 1] = [0b1001_1001];
+
+    #[test]
+    fn upgrade_v2_threads_srl_across_bands() {
+        let prev = ComponentCodecQuant {
+            ll3: 0,
+            hl3: 0,
+            lh3: 0,
+            hh3: 0,
+            hl2: 0,
+            lh2: 0,
+            hh2: 0,
+            hl1: 2,
+            lh1: 2,
+            hh1: 0,
+        };
+        let curr = ComponentCodecQuant {
+            ll3: 0,
+            hl3: 0,
+            lh3: 0,
+            hh3: 0,
+            hl2: 0,
+            lh2: 0,
+            hh2: 0,
+            hl1: 0,
+            lh1: 0,
+            hh1: 0,
+        };
+        let bands = get_band_layout(false);
+        let (hl1, lh1) = (bands[0], bands[1]);
+
+        // Every band-0/1 coefficient is non-zero-DAS (reads the empty raw stream, a
+        // no-op) except the first of each, which is zero-DAS (reads SRL).
+        let mut coefficients = vec![0i16; COEFFICIENTS_PER_COMPONENT];
+        let mut sign = vec![SIGN_POSITIVE; COEFFICIENTS_PER_COMPONENT];
+        sign[hl1.offset] = SIGN_ZERO;
+        sign[lh1.offset] = SIGN_ZERO;
+
+        decode_upgrade_pass_v2(
+            &SRL_TWO_VALUES_PLUS1_PLUS2,
+            &[],
+            &prev,
+            &curr,
+            false,
+            &mut coefficients,
+            &mut sign,
+        );
+
+        // curr_bit_pos is 0, so v2's `value << curr_bit_pos` lands the raw magnitude.
+        assert_eq!(coefficients[hl1.offset], 1);
+        assert_eq!(
+            coefficients[lh1.offset], 2,
+            "LH1 must read the SECOND SRL value (threaded), not restart at the first"
+        );
+        assert_eq!(sign[lh1.offset], SIGN_POSITIVE);
     }
 
     #[test]
