@@ -81,6 +81,12 @@ struct Args {
     #[clap(long = "gw-rpc", requires = "gw_endpoint")]
     gw_rpc: bool,
 
+    /// Progressive (RemoteFX) TILE_UPGRADE decode variant, for A/B testing image
+    /// quality against a server: 1 = baseline, 2 = threaded SRL reader, 3 = full
+    /// FreeRDP-faithful refinement.
+    #[clap(long = "graphics-upgrade", value_parser = clap::value_parser!(u8).range(1..=3), default_value_t = 1)]
+    graphics_upgrade: u8,
+
     /// An address on which the client will connect.
     #[clap(env = "RDP_HOSTNAME")]
     destination: Option<Destination>,
@@ -283,6 +289,11 @@ impl ViewerConfig {
         T: Into<std::ffi::OsString> + Clone,
     {
         let args = Args::parse_from(args);
+
+        // Process-global codec knob: select the progressive TILE_UPGRADE decode
+        // variant before any surface is decoded. Set here (ahead of the transport
+        // branches below) so it applies on every path, including `--rpc`.
+        ironrdp::graphics::progressive::set_upgrade_variant(args.graphics_upgrade);
 
         let mut properties = ironrdp_propertyset::PropertySet::new();
 
