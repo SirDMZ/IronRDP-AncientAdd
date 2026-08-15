@@ -712,10 +712,16 @@ impl GraphicsPipelineClient {
         if self.surfaces.remove(&surface_id).is_some() {
             self.compositor.delete_surface(surface_id);
             debug!(surface_id, "Surface deleted");
-            self.handler.on_surface_deleted(surface_id);
         } else {
-            warn!(surface_id, "DeleteSurface for unknown surface");
+            // ResetGraphics ([MS-RDPEGFX] 2.2.2.14) clears our surface table, but the
+            // server may still delete a pre-reset surface id afterwards. The handler
+            // owns per-surface decoder state (e.g. progressive tile coefficients) that
+            // must be freed on delete regardless of our own bookkeeping, so forward the
+            // event even for an id we no longer track. Handlers treat unknown ids as a
+            // no-op.
+            warn!(surface_id, "DeleteSurface for unknown surface, forwarding to handler");
         }
+        self.handler.on_surface_deleted(surface_id);
     }
 
     fn handle_map_surface(&mut self, surface_id: u16, origin_x: u32, origin_y: u32) {
@@ -1333,6 +1339,40 @@ mod tests {
         assert!(client.surfaces.is_empty(), "surfaces should be cleared");
         assert!(client.current_frame_id.is_none(), "frame_id should be reset");
         assert_eq!(client.frames_queued, 0, "frame queue should be reset");
+    }
+
+    /// Regression: a DeleteSurface for a surface id the client no longer tracks
+    /// (ResetGraphics clears the table, but a server may still delete a pre-reset id)
+    /// must still reach the handler, which owns per-surface decoder state to free.
+    /// Swallowing the event left that state stale for a recreated id.
+    #[test]
+    fn delete_surface_for_unknown_id_still_reaches_handler() {
+        struct RecordingHandler(Arc<Mutex<Vec<u16>>>);
+        impl GraphicsPipelineHandler for RecordingHandler {
+            fn on_capabilities_confirmed(&mut self, _caps: &CapabilitySet) {}
+            fn on_reset_graphics(&mut self, _width: u32, _height: u32) {}
+            fn on_surface_created(&mut self, _surface: &Surface) {}
+            fn on_surface_deleted(&mut self, surface_id: u16) {
+                self.0.lock().expect("deleted lock").push(surface_id);
+            }
+            fn on_surface_mapped(&mut self, _surface_id: u16, _x: u32, _y: u32) {}
+            fn on_bitmap_updated(&mut self, _update: &BitmapUpdate) {}
+            fn on_frame_complete(&mut self, _frame_id: u32) {}
+            fn on_close(&mut self) {}
+            fn on_unhandled_pdu(&mut self, _pdu: &GfxPdu) {}
+        }
+
+        let deleted = Arc::new(Mutex::new(Vec::new()));
+        let mut client = GraphicsPipelineClient::new(Box::new(RecordingHandler(Arc::clone(&deleted))), None);
+
+        // The client never tracked surface 7 (e.g. it was cleared by ResetGraphics).
+        let _ = client.handle_pdu(GfxPdu::DeleteSurface(crate::pdu::DeleteSurfacePdu { surface_id: 7 }));
+
+        assert_eq!(
+            deleted.lock().expect("deleted lock").as_slice(),
+            &[7],
+            "DeleteSurface for an untracked id must still be forwarded to the handler"
+        );
     }
 
     #[test]
