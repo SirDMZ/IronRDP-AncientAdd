@@ -69,6 +69,13 @@ ironrdp-viewer localhost --vmconnect <VM_ID> --vmconnect-basic --vmconnect-curre
 List VM IDs with `Get-VM | Select-Object Name, Id`.
 On local Windows VMConnect connections, the viewer accepts Hyper-V's private frame-buffer DVC and renders its shared-memory DIB.
 
+To connect through an RD Gateway, pass `--gw-endpoint <HOST[:PORT]>` with `--gw-user` and `--gw-pass`; `--gw-domain` sets the gateway account's domain when the user name doesn't carry it.
+The gateway transport is WebSocket by default, and `--gw-rpc` selects RPC over HTTP (MS-RPCH), which older gateways require.
+`--gw-rpc-engine` picks its implementation: `tsgu-rpc` (the default) mirrors FreeRDP's requests, and `mstsgu` also recycles channels before their lifetime ends and answers reauthentication requests.
+
+To build without a C toolchain (no CMake, NASM, or C compiler), use `--no-default-features --features rustls-rustcrypto,sound`.
+That build leaves out Opus, RDP-UDP, and Kerberos for gateway authentication.
+
 ## Agent RPC host
 
 The viewer can host the same local RPC protocol used by `ironrdp-agent`, while keeping its visible
@@ -102,6 +109,7 @@ Currently supported properties:
 - `gatewaycredentialssource:i:<value>`
 - `gatewayusername:s:<value>`
 - `GatewayPassword:s:<value>`
+- `ironrdp_gatewayrpch:i:<0|1>` (RPC-over-HTTP gateway transport)
 - `kdcproxyurl:s:<value>` (also `KDCProxyURL:s:<value>`)
 - `kdcproxyname:s:<value>`
 - `alternate shell:s:<value>`

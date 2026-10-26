@@ -32,17 +32,27 @@ The additions are a portrait of the server they were built for:
 
 - It sits behind an **RD Gateway that only speaks RPC-over-HTTP** (classic MS-TSGU), not
   the newer WebSocket transport → a from-scratch **`ironrdp-tsgu-rpc`** transport crate,
-  exposed in the viewer as `--gw-rpc` (with an optional `--gw-domain`).
+  selected in the viewer with `--gw-rpc` (with an optional `--gw-domain`). Upstream's
+  `ironrdp-mstsgu` implements the same transport and adds channel recycling and
+  reauthentication; `--gw-rpc-engine mstsgu` switches to it, so both can be compared
+  against the same gateway.
 - It streams the desktop with the **legacy RemoteFX Progressive + ClearCodec** pipeline
-  rather than H.264/AVC → progressive / ClearCodec / EGFX decode-robustness fixes and
-  **runtime-selectable progressive decode variants** (`--graphics-upgrade 1|2|3`).
-- It negotiates with the **older MS-RDPBCGR network auto-detection** → connect-time and
-  continuous **bandwidth measurement**.
+  rather than H.264/AVC → ClearCodec tolerance: a cached short V-bar that overruns its band
+  is clamped, as mstsc and FreeRDP do, instead of failing the whole frame. An opt-in EGFX
+  frame-acknowledgement mode (`FrameAckMode::SuspendAfterFirst`) stops the server from
+  pacing frames on acknowledgements when the client decodes slowly.
+- It expects the client to **describe its display** → one primary monitor spanning the
+  desktop is advertised by default, as mstsc and FreeRDP do.
 - The build host is a **Windows box with no C toolchain** → a **pure-Rust RustCrypto TLS**
-  backend and **PCM audio via cpal**, so the whole client builds and plays sound with no
-  CMake, NASM, or C compiler:
-  `cargo build -p ironrdp-viewer --no-default-features --features rustls-rustcrypto,sound`
-  (Opus stays available through an opt-in `sound-opus` for hosts that have a C toolchain).
+  backend and **cpal audio** (PCM, plus AAC through Media Foundation on Windows), so the
+  whole client builds and plays sound with no CMake, NASM, or C compiler:
+  `cargo build -p ironrdp-viewer --no-default-features --features rustls-rustcrypto,sound`.
+  Opus (`sound-opus`), RDP-UDP (`udp`), and Kerberos for gateway authentication need a C
+  toolchain and stay out of that build; smart-card CredSSP logon is opt-in (`scard`) for
+  the same reason.
+
+The fork tracks upstream `master` by merging it in, and drops its own version of a change
+once upstream covers it.
 
 See the [viewer README] for the full option list.
 
@@ -190,6 +200,7 @@ They are under _Computer Configuration → Administrative Templates → Windows 
 - [Teleport] for remote desktop web access
 - [Lamco RDP Server], a Wayland-native RDP server for Linux desktop sharing
 - [MacRDP], a native RDP server for macOS
+- [ClawTank], an open-source RDP server for macOS with H.264 graphics, virtual displays and an MCP server for agents
 - [`qemu-rdp`][qemu-rdp], an RDP server for QEMU displays
 - A growing set of community projects building RDP servers and clients on the crate suite
 
@@ -235,6 +246,7 @@ Licensed under either [MIT] or [Apache-2.0] at your option.
 [Teleport]: https://goteleport.com/
 [Lamco RDP Server]: https://lamco.ai/products/lamco-rdp-server/
 [MacRDP]: https://github.com/clintcan/macrdp
+[ClawTank]: https://github.com/HMAKT99/ClawTank
 [qemu-rdp]: https://gitlab.com/marcandre.lureau/qemu-display
 [Debian stable-backports]: https://packages.debian.org/search?suite=all&arch=any&searchon=names&keywords=rust
 [Fedora stable]: https://packages.fedoraproject.org/pkgs/rust/rust/
