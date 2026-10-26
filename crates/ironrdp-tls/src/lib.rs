@@ -3,6 +3,8 @@
 
 use std::sync::Arc;
 
+#[cfg(feature = "rustls-verifier")]
+use tokio as _;
 #[cfg(any(feature = "native-tls", test))]
 use tokio_native_tls as _;
 
@@ -18,8 +20,16 @@ mod impl_;
 #[path = "stub.rs"]
 mod impl_;
 
+#[cfg(feature = "rustls-verifier")]
+mod rustls_verifier;
+
 #[cfg(any(
-    not(any(feature = "stub", feature = "native-tls", feature = "rustls-no-provider")),
+    not(any(
+        feature = "stub",
+        feature = "native-tls",
+        feature = "rustls-no-provider",
+        feature = "rustls-verifier"
+    )),
     all(feature = "stub", feature = "native-tls"),
     all(feature = "stub", feature = "rustls-no-provider"),
     all(feature = "rustls-no-provider", feature = "native-tls"),
@@ -31,18 +41,22 @@ compile_error!(
 #[cfg(any(feature = "stub", feature = "native-tls", feature = "rustls-no-provider"))]
 pub use impl_::{
     TlsStream, negotiated, upgrade, upgrade_with_certificate_validation, upgrade_with_certificate_validation_callback,
+    upgrade_with_certificate_validation_callback_for_endpoint,
 };
+#[cfg(feature = "rustls-verifier")]
+pub use rustls_verifier::rustls_client_config;
 
 /// Called when the Rustls backend cannot validate a server certificate.
 ///
-/// The callback receives the leaf certificate's DER encoding and a validation-error
-/// description. Returning `true` accepts that certificate for the current handshake.
+/// The callback receives the leaf certificate's DER encoding, the configured endpoint,
+/// and a validation-error description. Returning `true` accepts that certificate for the
+/// current handshake.
 /// Callers must make this decision explicitly and should retain the certificate
 /// fingerprint rather than accepting a host blindly.
 ///
 /// The `native-tls` and stub backends cannot safely support this operation and return
 /// an error if it is requested.
-pub type CertificateValidationCallback = Arc<dyn Fn(&[u8], &str) -> bool + Send + Sync>;
+pub type CertificateValidationCallback = Arc<dyn Fn(&[u8], &str, &str) -> bool + Send + Sync>;
 
 /// Certificate-validation policy applied during a TLS handshake.
 ///

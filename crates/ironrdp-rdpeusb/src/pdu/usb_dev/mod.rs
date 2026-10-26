@@ -111,16 +111,10 @@ impl RegisterRequestCallback {
         let request_completion = match src.read_u32() {
             0x0 => None,
             _ => {
+                // The server allocates this ID in its own interface space and only uses it to
+                // receive completions, so any value is valid: Windows Server picks one below 4.
                 ensure_size!(in: src, size: InterfaceId::FIXED_PART_SIZE);
-                match src.read_u32() {
-                    0x0..=0x3 => {
-                        return Err(invalid_field_err!(
-                            "RequestCompletion",
-                            "conflict with default interfaces"
-                        ));
-                    }
-                    value => Some(InterfaceId::try_from(value)?),
-                }
+                Some(InterfaceId::try_from(src.read_u32())?)
             }
         };
         Ok(Self {
@@ -224,7 +218,7 @@ impl IoControl {
             0x220_020 => IoctlInternalUsb::GetHubName,
             0x220_420 => IoctlInternalUsb::GetBusInfo,
             0x220_424 => IoctlInternalUsb::GetControllerName,
-            value => return Err(unsupported_value_err!("IoControlCode", format!("{value}"))),
+            value => return Err(unsupported_value_err!("IoControlCode", format!("{value}"), in: src)),
         };
         let input_buffer_size = src.read_u32().try_into().map_err(|e| other_err!(source: e))?;
         ensure_size!(in: src,
@@ -246,14 +240,14 @@ impl IoControl {
         io_control
             .check_output_buffer_size()
             .map(|()| io_control)
-            .map_err(|reason| invalid_field_err!("IO_CONTROL::OutputBufferSize", reason))
+            .map_err(|reason| invalid_field_err!("IO_CONTROL::OutputBufferSize", reason, in: src))
     }
 }
 
 impl Encode for IoControl {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
         self.check_output_buffer_size()
-            .map_err(|reason| invalid_field_err!("IO_CONTROL::OutputBufferSize", reason))?;
+            .map_err(|reason| invalid_field_err!("IO_CONTROL::OutputBufferSize", reason, in: dst))?;
         ensure_size!(in: dst, size: self.size());
         self.header().encode(dst)?;
 
@@ -684,7 +678,7 @@ impl TransferInRequest {
 
         transfer_in_req
             .check_output_buffer_size()
-            .map_err(|reason| invalid_field_err!("TRANSFER_IN_REQUEST::OutputBufferSize", reason))?;
+            .map_err(|reason| invalid_field_err!("TRANSFER_IN_REQUEST::OutputBufferSize", reason, in: src))?;
 
         Ok(transfer_in_req)
     }
@@ -693,7 +687,7 @@ impl TransferInRequest {
 impl Encode for TransferInRequest {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
         self.check_output_buffer_size()
-            .map_err(|reason| invalid_field_err!("TRANSFER_IN_REQUEST::OutputBufferSize", reason))?;
+            .map_err(|reason| invalid_field_err!("TRANSFER_IN_REQUEST::OutputBufferSize", reason, in: dst))?;
         ensure_size!(in: dst, size: self.size());
 
         self.header().encode(dst)?;
@@ -829,7 +823,7 @@ impl RetractDevice {
         let reason = src.read_u32();
         #[expect(clippy::as_conversions)]
         if reason != UsbRetractReason::BlockedByPolicy as u32 {
-            return Err(unsupported_value_err!("RETRACT_DEVICE::Reason", format!("{reason}")));
+            return Err(unsupported_value_err!("RETRACT_DEVICE::Reason", format!("{reason}"), in: src));
         }
 
         Ok(Self {

@@ -19,6 +19,8 @@ use tracing::{debug, trace, warn};
 use crate::image::DecodedImage;
 use crate::palette::Palette;
 use crate::pointer::PointerCache;
+#[cfg(feature = "qoiz")]
+use crate::qoiz;
 use crate::{SessionError, SessionErrorExt as _, SessionErrorKind, SessionResult, reason_err, rfx};
 
 /// A bounded category for a failed Fast-Path bulk decompression operation.
@@ -141,7 +143,7 @@ pub struct Processor {
     bitmap_recovery_requested: bool,
     bitmap_recovery_pending: bool,
     #[cfg(feature = "qoiz")]
-    zdctx: zstd_safe::DCtx<'static>,
+    qoiz_decompressor: qoiz::Decompressor,
 }
 
 impl Processor {
@@ -209,7 +211,7 @@ impl Processor {
                 if raw_update_code.is_some_and(is_visual_update_code)
                     && matches!(error.kind(), DecodeErrorKind::NotEnoughBytes { .. }) =>
             {
-                let DecodeErrorKind::NotEnoughBytes { received, expected } = error.kind() else {
+                let DecodeErrorKind::NotEnoughBytes { received, expected, .. } = error.kind() else {
                     return Err(SessionError::decode(error));
                 };
                 let discarded_bytes = input.read_remaining().len();
@@ -276,11 +278,11 @@ impl Processor {
                 // to ignore the unsupported update PDUs, but this is a fragile logic and the rationale behind it is not
                 // obvious.
                 match e.kind() {
-                    DecodeErrorKind::InvalidField { field, reason } => {
+                    DecodeErrorKind::InvalidField { field, reason, .. } => {
                         warn!(field, reason, "Ignoring invalid Fast-Path update");
                         processor_updates.push(UpdateKind::None);
                     }
-                    DecodeErrorKind::NotEnoughBytes { received, expected }
+                    DecodeErrorKind::NotEnoughBytes { received, expected, .. }
                         if is_visual_update_code(attributes.update_code.as_u8()) =>
                     {
                         warn!(
@@ -795,23 +797,7 @@ impl Processor {
                         }
                         #[cfg(feature = "qoiz")]
                         ironrdp_pdu::rdp::capability_sets::CODEC_ID_QOIZ => {
-                            let compressed = &bits.extended_bitmap_data.data;
-                            let mut input = zstd_safe::InBuffer::around(compressed);
-                            let mut data = vec![0; compressed.len() * 4];
-                            let mut pos = 0;
-                            loop {
-                                let mut output = zstd_safe::OutBuffer::around_pos(data.as_mut_slice(), pos);
-                                self.zdctx
-                                    .decompress_stream(&mut output, &mut input)
-                                    .map_err(zstd_safe::get_error_name)
-                                    .map_err(|e| reason_err!("zstd", "{}", e))?;
-                                pos = output.pos();
-                                if pos == output.capacity() {
-                                    data.resize(data.capacity() * 2, 0);
-                                } else {
-                                    break;
-                                }
-                            }
+                            let data = self.qoiz_decompressor.decompress(bits.extended_bitmap_data.data)?;
 
                             qoi_apply(image, destination, &data, &mut update_rectangle)?;
                         }
@@ -907,7 +893,7 @@ impl ProcessorBuilder {
             bitmap_recovery_requested: false,
             bitmap_recovery_pending: false,
             #[cfg(feature = "qoiz")]
-            zdctx: zstd_safe::DCtx::default(),
+            qoiz_decompressor: qoiz::Decompressor::default(),
         }
     }
 }

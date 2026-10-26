@@ -4,11 +4,12 @@ use ironrdp_pdu::rdp;
 use ironrdp_pdu::rdp::capability_sets::{
     CapabilitySet, InputFlags, Rail, RailSupportLevel, WindowList, WindowSupportLevel,
 };
-use tracing::{debug, warn};
+use ironrdp_pdu::rdp::server_redirection::ServerRedirectionPdu;
+use tracing::{debug, info, warn};
 
 use crate::{
     Config, ConnectionFinalizationSequence, ConnectorError, ConnectorErrorExt as _, ConnectorResult, DesktopSize,
-    Sequence, State, Written, general_err, reason_err,
+    MonotonicInstant, Sequence, State, Written, general_err, reason_err,
 };
 
 /// Represents the Capability Exchange and Connection Finalization phases
@@ -26,6 +27,7 @@ use crate::{
 #[derive(Debug, Clone)]
 pub struct ConnectionActivationSequence {
     state: ConnectionActivationState,
+    monitor_layout: Option<rdp::finalization_messages::MonitorLayoutPdu>,
     config: Config,
     // The MCS channel IDs are invariant for the whole life of the sequence: they are negotiated
     // once and never change, even across a Deactivation-Reactivation Sequence. They are stored
@@ -41,6 +43,7 @@ impl ConnectionActivationSequence {
         //   I doubt this type really needs every field there.
         Self {
             state: ConnectionActivationState::CapabilitiesExchange,
+            monitor_layout: None,
             config,
             io_channel_id,
             user_channel_id,
@@ -57,7 +60,12 @@ impl ConnectionActivationSequence {
 
     /// Returns the current state as a distinct type, rather than `&dyn State` provided by [`Self::state`].
     pub fn connection_activation_state(&self) -> ConnectionActivationState {
-        self.state
+        self.state.clone()
+    }
+
+    /// Returns the server-reported monitor layout received during this activation.
+    pub fn monitor_layout(&self) -> Option<rdp::finalization_messages::MonitorLayoutPdu> {
+        self.monitor_layout.clone()
     }
 }
 
@@ -75,6 +83,7 @@ pub struct ConnectionActivationFactory {
     config: Config,
     io_channel_id: u16,
     user_channel_id: u16,
+    multitransport_soft_sync: bool,
 }
 
 impl ConnectionActivationFactory {
@@ -83,7 +92,17 @@ impl ConnectionActivationFactory {
             config,
             io_channel_id,
             user_channel_id,
+            multitransport_soft_sync: false,
         }
+    }
+
+    pub(crate) fn with_multitransport_soft_sync(mut self, multitransport_soft_sync: bool) -> Self {
+        self.multitransport_soft_sync = multitransport_soft_sync;
+        self
+    }
+
+    pub(crate) fn multitransport_soft_sync(&self) -> bool {
+        self.multitransport_soft_sync
     }
 
     pub fn io_channel_id(&self) -> u16 {
@@ -105,7 +124,7 @@ impl Sequence for ConnectionActivationSequence {
     fn next_pdu_hint(&self) -> Option<&dyn ironrdp_pdu::PduHint> {
         match &self.state {
             ConnectionActivationState::Consumed => None,
-            ConnectionActivationState::Finalized { .. } => None,
+            ConnectionActivationState::Finalized { .. } | ConnectionActivationState::Redirected { .. } => None,
             ConnectionActivationState::CapabilitiesExchange => Some(&ironrdp_pdu::X224_HINT),
             ConnectionActivationState::ConnectionFinalization {
                 connection_finalization,
@@ -118,9 +137,35 @@ impl Sequence for ConnectionActivationSequence {
         &self.state
     }
 
-    fn step(&mut self, input: &[u8], output: &mut ironrdp_core::WriteBuf) -> ConnectorResult<Written> {
+    fn step(
+        &mut self,
+        input: &[u8],
+        received_at: Option<MonotonicInstant>,
+        output: &mut ironrdp_core::WriteBuf,
+    ) -> ConnectorResult<Written> {
+        // The server may redirect the client instead of, or in the middle of, activating it
+        // ([MS-RDPBCGR] 3.2.5.13.1).
+        if matches!(
+            self.state,
+            ConnectionActivationState::CapabilitiesExchange | ConnectionActivationState::ConnectionFinalization { .. }
+        ) && let Some(redirection) = server_redirection(input)?
+        {
+            if redirection.is_informational() {
+                debug!(?redirection, "Ignoring informational Server Redirection PDU");
+            } else {
+                info!(session_id = redirection.session_id, "Server requested a redirection");
+                debug!(?redirection, "Received");
+                self.state = ConnectionActivationState::Redirected {
+                    redirection: Box::new(redirection),
+                };
+            }
+            return Ok(Written::Nothing);
+        }
+
         let (written, next_state) = match mem::take(&mut self.state) {
-            ConnectionActivationState::Consumed | ConnectionActivationState::Finalized { .. } => {
+            ConnectionActivationState::Consumed
+            | ConnectionActivationState::Finalized { .. }
+            | ConnectionActivationState::Redirected { .. } => {
                 return Err(general_err!(
                     "connector sequence state is finalized or consumed (this is a bug)"
                 ));
@@ -316,7 +361,7 @@ impl Sequence for ConnectionActivationSequence {
             } => {
                 debug!("Connection Finalization");
 
-                let written = connection_finalization.step(input, output)?;
+                let written = connection_finalization.step(input, received_at, output)?;
 
                 let next_state = if !connection_finalization.state.is_terminal() {
                     ConnectionActivationState::ConnectionFinalization {
@@ -330,6 +375,7 @@ impl Sequence for ConnectionActivationSequence {
                         connection_finalization,
                     }
                 } else {
+                    self.monitor_layout = connection_finalization.monitor_layout;
                     ConnectionActivationState::Finalized {
                         desktop_size,
                         share_id,
@@ -353,7 +399,7 @@ impl Sequence for ConnectionActivationSequence {
     }
 }
 
-#[derive(Default, Debug, Copy, Clone)]
+#[derive(Default, Debug, Clone)]
 pub enum ConnectionActivationState {
     #[default]
     Consumed,
@@ -392,6 +438,13 @@ pub enum ConnectionActivationState {
         /// The server-negotiated Window List support level.
         window_support_level: Option<WindowSupportLevel>,
     },
+    /// The server sent a Server Redirection PDU: the client must close this connection and connect to the target it
+    /// describes ([MS-RDPBCGR] 3.2.5.13.1).
+    ///
+    /// [MS-RDPBCGR]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/
+    Redirected {
+        redirection: Box<ServerRedirectionPdu>,
+    },
 }
 
 impl State for ConnectionActivationState {
@@ -401,11 +454,15 @@ impl State for ConnectionActivationState {
             ConnectionActivationState::CapabilitiesExchange => "CapabilitiesExchange",
             ConnectionActivationState::ConnectionFinalization { .. } => "ConnectionFinalization",
             ConnectionActivationState::Finalized { .. } => "Finalized",
+            ConnectionActivationState::Redirected { .. } => "Redirected",
         }
     }
 
     fn is_terminal(&self) -> bool {
-        matches!(self, ConnectionActivationState::Finalized { .. })
+        matches!(
+            self,
+            ConnectionActivationState::Finalized { .. } | ConnectionActivationState::Redirected { .. }
+        )
     }
 
     fn as_any(&self) -> &dyn core::any::Any {
@@ -414,6 +471,16 @@ impl State for ConnectionActivationState {
 }
 
 const DEFAULT_POINTER_CACHE_SIZE: u16 = 32;
+
+/// Decodes `input` as a Server Redirection PDU received on the I/O channel, if it is one.
+///
+/// Anything that is not an MCS Send Data Indication is left for the regular decoding path to report.
+fn server_redirection(input: &[u8]) -> ConnectorResult<Option<ServerRedirectionPdu>> {
+    let Ok(ctx) = ironrdp_pdu::mcs::decode_send_data_indication(input) else {
+        return Ok(None);
+    };
+    rdp::server_redirection::decode_server_redirection(ctx.user_data).map_err(ConnectorError::decode)
+}
 
 fn server_window_list(capability_sets: &[CapabilitySet]) -> Option<WindowList> {
     capability_sets.iter().find_map(|capability_set| {
@@ -467,6 +534,9 @@ fn remote_app_rail_capability(
     }))
 }
 
+/// Build Client Confirm Active from the connection config and server capabilities.
+///
+/// Legacy graphics mode skips enhanced surface capabilities when no bitmap codecs are advertised.
 fn create_client_confirm_active(
     config: &Config,
     mut server_capability_sets: Vec<CapabilitySet>,
@@ -478,7 +548,7 @@ fn create_client_confirm_active(
         ClientConfirmActive, CmdFlags, DemandActive, FrameAcknowledge, GLYPH_CACHE_NUM, General, GeneralExtraFlags,
         GlyphCache, GlyphSupportLevel, Input, LargePointer, LargePointerSupportFlags, MultifragmentUpdate,
         OffscreenBitmapCache, Order, OrderFlags, OrderSupportExFlags, Pointer, SERVER_CHANNEL_ID, Sound, SoundFlags,
-        SupportLevel, SurfaceCommands, VirtualChannel, VirtualChannelFlags, client_codecs_capabilities,
+        SupportLevel, SurfaceCommands, VirtualChannel, VirtualChannelFlags,
     };
 
     let remote_app_rail_capability = remote_app_rail_capability(
@@ -504,6 +574,9 @@ fn create_client_confirm_active(
     } else {
         BitmapDrawingFlags::ALLOW_SKIP_ALPHA
     };
+
+    let bitmap_codecs = config.bitmap.as_ref().map(|bitmap| bitmap.codecs.clone());
+    let enable_surface_commands = bitmap_codecs.as_ref().is_some_and(|codecs| !codecs.0.is_empty());
 
     server_capability_sets.extend_from_slice(&[
         CapabilitySet::General(General {
@@ -578,20 +651,24 @@ fn create_client_confirm_active(
             // in Windows 2019 and older
             flags: LargePointerSupportFlags::UP_TO_96X96_PIXELS | LargePointerSupportFlags::UP_TO_384X384_PIXELS,
         }),
-        CapabilitySet::SurfaceCommands(SurfaceCommands {
-            flags: CmdFlags::SET_SURFACE_BITS | CmdFlags::STREAM_SURFACE_BITS | CmdFlags::FRAME_MARKER,
-        }),
-        CapabilitySet::BitmapCodecs(match config.bitmap.as_ref().map(|b| b.codecs.clone()) {
-            Some(codecs) => codecs,
-            None => client_codecs_capabilities(&[]).expect("can't panic for &[]"),
-        }),
-        CapabilitySet::FrameAcknowledge(FrameAcknowledge {
-            // FIXME(#447): Revert this to 2 per FreeRDP.
-            // This is a temporary hack to fix a resize bug, see:
-            // https://github.com/Devolutions/IronRDP/issues/447
-            max_unacknowledged_frame_count: 20,
-        }),
     ]);
+
+    if enable_surface_commands {
+        // Advertise Surface Commands, Bitmap Codecs, and Frame Acknowledge only when a concrete
+        // bitmap codec is present; otherwise keep basic bitmap updates for legacy servers.
+        server_capability_sets.extend_from_slice(&[
+            CapabilitySet::SurfaceCommands(SurfaceCommands {
+                flags: CmdFlags::SET_SURFACE_BITS | CmdFlags::STREAM_SURFACE_BITS | CmdFlags::FRAME_MARKER,
+            }),
+            CapabilitySet::BitmapCodecs(bitmap_codecs.expect("checked by enable_surface_commands")),
+            CapabilitySet::FrameAcknowledge(FrameAcknowledge {
+                // FIXME(#447): Revert this to 2 per FreeRDP.
+                // This is a temporary hack to fix a resize bug, see:
+                // https://github.com/Devolutions/IronRDP/issues/447
+                max_unacknowledged_frame_count: 20,
+            }),
+        ]);
+    }
 
     if !server_capability_sets
         .iter()
@@ -639,12 +716,17 @@ fn requested_bitmap_color_depth(bitmap: Option<&crate::BitmapConfig>) -> Connect
 
 #[cfg(test)]
 mod tests {
-    use ironrdp_pdu::rdp::capability_sets::{CapabilitySet, Rail, RailSupportLevel, WindowList, WindowSupportLevel};
+    use ironrdp_pdu::gcc;
+    use ironrdp_pdu::rdp::capability_sets::{
+        BitmapCodecs, CapabilitySet, Codec, CodecProperty, FrameAcknowledge, Rail, RailSupportLevel, WindowList,
+        WindowSupportLevel,
+    };
 
     use super::{
-        negotiated_window_support_level, remote_app_rail_capability, requested_bitmap_color_depth, server_window_list,
+        create_client_confirm_active, negotiated_window_support_level, remote_app_rail_capability,
+        requested_bitmap_color_depth, server_window_list,
     };
-    use crate::BitmapConfig;
+    use crate::{BitmapConfig, Config, Credentials, DesktopSize};
 
     #[test]
     fn bitmap_capability_uses_requested_color_depth() {
@@ -653,7 +735,7 @@ mod tests {
             let bitmap = BitmapConfig {
                 color_depth: u32::from(expected_color_depth),
                 lossy_compression: false,
-                codecs: ironrdp_pdu::rdp::capability_sets::BitmapCodecs(Vec::new()),
+                codecs: BitmapCodecs(Vec::new()),
             };
 
             assert_eq!(
@@ -736,5 +818,148 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn confirm_active_omits_surface_capabilities_without_bitmap_codecs() {
+        for bitmap in [
+            None,
+            Some(BitmapConfig {
+                color_depth: 32,
+                lossy_compression: false,
+                codecs: BitmapCodecs(Vec::new()),
+            }),
+        ] {
+            let confirm = create_client_confirm_active(
+                &test_config(bitmap),
+                Vec::new(),
+                DesktopSize {
+                    width: 1024,
+                    height: 768,
+                },
+                None,
+            )
+            .unwrap();
+
+            assert!(
+                !confirm
+                    .pdu
+                    .capability_sets
+                    .iter()
+                    .any(|capability| matches!(capability, CapabilitySet::SurfaceCommands(_))),
+                "legacy graphics must omit SurfaceCommands"
+            );
+            assert!(
+                !confirm
+                    .pdu
+                    .capability_sets
+                    .iter()
+                    .any(|capability| matches!(capability, CapabilitySet::BitmapCodecs(_))),
+                "legacy graphics must omit BitmapCodecs"
+            );
+            assert!(
+                !confirm
+                    .pdu
+                    .capability_sets
+                    .iter()
+                    .any(|capability| matches!(capability, CapabilitySet::FrameAcknowledge(_))),
+                "legacy graphics must omit FrameAcknowledge"
+            );
+        }
+    }
+
+    #[test]
+    fn confirm_active_advertises_surface_capabilities_with_bitmap_codecs() {
+        let codecs = BitmapCodecs(vec![Codec {
+            id: 1,
+            property: CodecProperty::Ignore,
+        }]);
+        let confirm = create_client_confirm_active(
+            &test_config(Some(BitmapConfig {
+                color_depth: 32,
+                lossy_compression: false,
+                codecs: codecs.clone(),
+            })),
+            Vec::new(),
+            DesktopSize {
+                width: 1024,
+                height: 768,
+            },
+            None,
+        )
+        .unwrap();
+
+        assert!(
+            confirm
+                .pdu
+                .capability_sets
+                .iter()
+                .any(|capability| matches!(capability, CapabilitySet::SurfaceCommands(_)))
+        );
+        assert!(
+            confirm
+                .pdu
+                .capability_sets
+                .contains(&CapabilitySet::BitmapCodecs(codecs))
+        );
+        assert!(confirm.pdu.capability_sets.iter().any(|capability| matches!(
+            capability,
+            CapabilitySet::FrameAcknowledge(FrameAcknowledge {
+                max_unacknowledged_frame_count: 20,
+            })
+        )));
+    }
+
+    fn test_config(bitmap: Option<BitmapConfig>) -> Config {
+        Config {
+            desktop_size: DesktopSize {
+                width: 1024,
+                height: 768,
+            },
+            monitor_layout: None,
+            desktop_scale_factor: 0,
+            desktop_physical_size: None,
+            desktop_orientation: None,
+            device_scale_factor: None,
+            monitor_extended_layout: None,
+            relative_mouse_input: false,
+            enable_tls: true,
+            enable_credssp: false,
+            enable_standard_rdp_security: false,
+            credentials: Credentials::UsernamePassword {
+                username: "test".into(),
+                password: "test".into(),
+            },
+            domain: None,
+            client_build: 0,
+            client_name: "test".into(),
+            keyboard_type: gcc::KeyboardType::IBM_ENHANCED,
+            keyboard_subtype: 0,
+            keyboard_layout: 0,
+            keyboard_functional_keys_count: 12,
+            connection_type: gcc::ConnectionType::Lan,
+            ime_file_name: String::new(),
+            bitmap,
+            dig_product_id: String::new(),
+            client_dir: String::new(),
+            platform: ironrdp_pdu::rdp::capability_sets::MajorPlatformType::UNIX,
+            hardware_id: None,
+            request_data: None,
+            autologon: false,
+            enable_audio_playback: false,
+            enable_audio_capture: false,
+            license_cache: None,
+            compression_type: None,
+            enable_server_pointer: false,
+            pointer_software_rendering: false,
+            multitransport_flags: None,
+            support_dyn_vc_gfx_protocol: false,
+            performance_flags: Default::default(),
+            timezone_info: Default::default(),
+            alternate_shell: String::new(),
+            work_dir: String::new(),
+            remote_application_mode: false,
+            rail_support_level: RailSupportLevel::SUPPORTED,
+        }
     }
 }

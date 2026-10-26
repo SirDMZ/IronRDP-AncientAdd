@@ -32,4 +32,21 @@ public enum ActiveStageOutputType
     AutoReconnectCookie = 11,
     WindowingOrders = 12,
     AutoReconnectFailed = 13,
+    MonitorLayout = 14,
+    /// <summary>
+    /// RemoteApp window pixels from graphics pipeline surfaces mapped to RAIL windows.
+    /// The pixels are not exposed yet: this binding does not enable RemoteApp,
+    /// so servers do not map surfaces to windows.
+    /// </summary>
+    WindowSurfaceUpdates = 15,
+    /// <summary>
+    /// The server sent a Server Redirection PDU; use `get_server_redirection()` to read the target.
+    /// </summary>
+    ServerRedirection = 16,
+    LogonErrors = 17,
+    /// <summary>
+    /// The ID of the remote session, reported with a completed logon.
+    /// Use `get_session_id()` to retrieve it.
+    /// </summary>
+    SessionId = 18,
 }

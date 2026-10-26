@@ -339,7 +339,8 @@ impl Encode for AutoDetectRequest {
                     if data.is_empty() {
                         return Err(invalid_field_err!(
                             "payload",
-                            "connect-time Bandwidth Measure Stop requires a non-empty payload"
+                            "connect-time Bandwidth Measure Stop requires a non-empty payload",
+                            in: dst
                         ));
                     }
                     dst.write_u8(0x08); // headerLength (with payload)
@@ -382,16 +383,14 @@ impl Encode for AutoDetectRequest {
                 // bandwidth where the decoder expects baseRTT, corrupting it silently.
                 let (want_base_rtt, want_bandwidth) = netchar_fields(*request_type);
                 if want_base_rtt {
-                    dst.write_u32(
-                        base_rtt_ms
-                            .ok_or_else(|| invalid_field_err!("baseRTT", "requestType requires a baseRTT value"))?,
-                    );
+                    dst.write_u32(base_rtt_ms.ok_or_else(
+                        || invalid_field_err!("baseRTT", "requestType requires a baseRTT value", in: dst),
+                    )?);
                 }
                 if want_bandwidth {
-                    dst.write_u32(
-                        bandwidth_kbps
-                            .ok_or_else(|| invalid_field_err!("bandwidth", "requestType requires a bandwidth value"))?,
-                    );
+                    dst.write_u32(bandwidth_kbps.ok_or_else(
+                        || invalid_field_err!("bandwidth", "requestType requires a bandwidth value", in: dst),
+                    )?);
                 }
                 dst.write_u32(*average_rtt_ms);
             }
@@ -442,10 +441,8 @@ impl<'de> Decode<'de> for AutoDetectRequest {
         let header_type_id = src.read_u8();
 
         if header_type_id != TYPE_ID_AUTODETECT_REQUEST {
-            return Err(invalid_field_err!(
-                "headerTypeId",
-                "expected TYPE_ID_AUTODETECT_REQUEST (0x00)"
-            ));
+            return Err(invalid_field_err!( "headerTypeId",
+                "expected TYPE_ID_AUTODETECT_REQUEST (0x00)", in: src));
         }
 
         let sequence_number = src.read_u16();
@@ -544,7 +541,7 @@ impl<'de> Decode<'de> for AutoDetectRequest {
                 })
             }
 
-            _ => Err(invalid_field_err!("requestType", "unknown autodetect request type")),
+            _ => Err(invalid_field_err!("requestType", "unknown autodetect request type", in: src)),
         }
     }
 }
@@ -699,10 +696,8 @@ impl<'de> Decode<'de> for AutoDetectResponse {
         let header_type_id = src.read_u8();
 
         if header_type_id != TYPE_ID_AUTODETECT_RESPONSE {
-            return Err(invalid_field_err!(
-                "headerTypeId",
-                "expected TYPE_ID_AUTODETECT_RESPONSE (0x01)"
-            ));
+            return Err(invalid_field_err!( "headerTypeId",
+                "expected TYPE_ID_AUTODETECT_RESPONSE (0x01)", in: src));
         }
 
         let sequence_number = src.read_u16();
@@ -734,7 +729,7 @@ impl<'de> Decode<'de> for AutoDetectResponse {
                 })
             }
 
-            _ => Err(invalid_field_err!("responseType", "unknown autodetect response type")),
+            _ => Err(invalid_field_err!("responseType", "unknown autodetect response type", in: src)),
         }
     }
 }
@@ -796,7 +791,7 @@ impl<'de> Decode<'de> for AutoDetectReqPdu {
         let security_header = BasicSecurityHeader::decode(src)?;
 
         if !security_header.flags.contains(BasicSecurityHeaderFlags::AUTODETECT_REQ) {
-            return Err(invalid_field_err!("securityHeader", "expected SEC_AUTODETECT_REQ flag"));
+            return Err(invalid_field_err!("securityHeader", "expected SEC_AUTODETECT_REQ flag", in: src));
         }
 
         let request = AutoDetectRequest::decode(src)?;
@@ -856,7 +851,7 @@ impl<'de> Decode<'de> for AutoDetectRspPdu {
         let security_header = BasicSecurityHeader::decode(src)?;
 
         if !security_header.flags.contains(BasicSecurityHeaderFlags::AUTODETECT_RSP) {
-            return Err(invalid_field_err!("securityHeader", "expected SEC_AUTODETECT_RSP flag"));
+            return Err(invalid_field_err!("securityHeader", "expected SEC_AUTODETECT_RSP flag", in: src));
         }
 
         let response = AutoDetectResponse::decode(src)?;
@@ -954,6 +949,24 @@ mod tests {
         0x0A, 0x00, 0x00, 0x00, // baseRTT = 10
         0xE8, 0x03, 0x00, 0x00, // bandwidth = 1000
         0x14, 0x00, 0x00, 0x00, // averageRTT = 20
+    ];
+
+    const NETCHAR_RTT_WIRE: &[u8] = &[
+        0x0E, // headerLength
+        0x00, // headerTypeId
+        0x07, 0x00, // sequenceNumber = 7
+        0x40, 0x08, // requestType = NETCHAR_RESULT_RTT (0x0840)
+        0x08, 0x00, 0x00, 0x00, // baseRTT = 8
+        0x12, 0x00, 0x00, 0x00, // averageRTT = 18
+    ];
+
+    const NETCHAR_BW_RTT_WIRE: &[u8] = &[
+        0x0E, // headerLength
+        0x00, // headerTypeId
+        0x08, 0x00, // sequenceNumber = 8
+        0x80, 0x08, // requestType = NETCHAR_RESULT_BW_RTT (0x0880)
+        0xF4, 0x01, 0x00, 0x00, // bandwidth = 500
+        0x16, 0x00, 0x00, 0x00, // averageRTT = 22
     ];
 
     #[test]
@@ -1096,6 +1109,48 @@ mod tests {
         let pdu = AutoDetectRequest::netchar_result(6, 10, 1000, 20);
         let encoded = ironrdp_core::encode_vec(&pdu).unwrap();
         assert_eq!(encoded.as_slice(), NETCHAR_ALL_WIRE);
+    }
+
+    #[test]
+    fn decode_netchar_rtt() {
+        let pdu = ironrdp_core::decode::<AutoDetectRequest>(NETCHAR_RTT_WIRE).unwrap();
+        match pdu {
+            AutoDetectRequest::NetworkCharacteristicsResult {
+                sequence_number,
+                request_type,
+                base_rtt_ms,
+                bandwidth_kbps,
+                average_rtt_ms,
+            } => {
+                assert_eq!(sequence_number, 7);
+                assert_eq!(request_type, NETCHAR_RESULT_RTT);
+                assert_eq!(base_rtt_ms, Some(8));
+                assert_eq!(bandwidth_kbps, None);
+                assert_eq!(average_rtt_ms, 18);
+            }
+            other => panic!("expected NetworkCharacteristicsResult, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_netchar_bw_rtt() {
+        let pdu = ironrdp_core::decode::<AutoDetectRequest>(NETCHAR_BW_RTT_WIRE).unwrap();
+        match pdu {
+            AutoDetectRequest::NetworkCharacteristicsResult {
+                sequence_number,
+                request_type,
+                base_rtt_ms,
+                bandwidth_kbps,
+                average_rtt_ms,
+            } => {
+                assert_eq!(sequence_number, 8);
+                assert_eq!(request_type, NETCHAR_RESULT_BW_RTT);
+                assert_eq!(base_rtt_ms, None);
+                assert_eq!(bandwidth_kbps, Some(500));
+                assert_eq!(average_rtt_ms, 22);
+            }
+            other => panic!("expected NetworkCharacteristicsResult, got {other:?}"),
+        }
     }
 
     #[test]

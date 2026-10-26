@@ -25,8 +25,8 @@ pub use sspi;
 
 pub use self::channel_connection::{ChannelConnectionSequence, ChannelConnectionState};
 pub use self::connection::{
-    ClientConnector, ClientConnectorState, ConnectionResult, DynamicStaticChannelAttachError, MultitransportResult,
-    encode_send_data_request,
+    ClientConnector, ClientConnectorState, ConnectionOutcome, ConnectionResult, DynamicStaticChannelAttachError,
+    MultitransportResult, encode_send_data_request,
 };
 pub use self::connection_finalization::{ConnectionFinalizationSequence, ConnectionFinalizationState};
 pub use self::license_exchange::{LicenseExchangeSequence, LicenseExchangeState};
@@ -143,10 +143,44 @@ impl Credentials {
 pub struct Config {
     /// The initial desktop size to request
     pub desktop_size: DesktopSize,
+    /// The optional client monitor layout advertised in the GCC Client Monitor Data block.
+    ///
+    /// When present, [`desktop_size`](Self::desktop_size) must describe the virtual desktop
+    /// containing these monitors.
+    pub monitor_layout: Option<gcc::ClientMonitorData>,
     /// The initial desktop scale factor to request.
     ///
     /// This becomes the `desktop_scale_factor` in the [`TS_UD_CS_CORE`](gcc::ClientCoreOptionalData) structure.
     pub desktop_scale_factor: u32,
+    /// The physical width and height of the desktop, in millimeters.
+    ///
+    /// These become `desktopPhysicalWidth` and `desktopPhysicalHeight` in the
+    /// [`TS_UD_CS_CORE`](gcc::ClientCoreOptionalData) structure. `None` sends zero, which servers ignore.
+    pub desktop_physical_size: Option<(u32, u32)>,
+    /// The orientation of the desktop.
+    ///
+    /// This becomes `desktopOrientation` in the [`TS_UD_CS_CORE`](gcc::ClientCoreOptionalData)
+    /// structure. `None` derives landscape or portrait from [`desktop_size`](Self::desktop_size).
+    pub desktop_orientation: Option<gcc::MonitorOrientation>,
+    /// The device scale factor (100, 140 or 180).
+    ///
+    /// This becomes `deviceScaleFactor` in the [`TS_UD_CS_CORE`](gcc::ClientCoreOptionalData) structure,
+    /// which servers only honor alongside a valid [`desktop_scale_factor`](Self::desktop_scale_factor).
+    /// `None` sends 100.
+    pub device_scale_factor: Option<u32>,
+    /// Per-monitor physical size, orientation and scale advertised in the GCC Client Monitor Extended Data block.
+    ///
+    /// Sent only together with [`monitor_layout`](Self::monitor_layout), with one entry per monitor in the same order.
+    /// A layout whose entry count differs from `monitor_layout` is not sent.
+    pub monitor_extended_layout: Option<gcc::ClientMonitorExtendedData>,
+    /// Whether the client sends relative mouse input ([MS-RDPBCGR] 2.2.8.1.2.2.7).
+    ///
+    /// This sets `RNS_UD_CS_RELATIVE_MOUSE_INPUT` in the `earlyCapabilityFlags` of the
+    /// [`TS_UD_CS_CORE`](gcc::ClientCoreOptionalData) structure and advertises RDP 10.12
+    /// (`0x00080011`), the lowest version for which servers honor relative mouse support.
+    ///
+    /// [MS-RDPBCGR]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/
+    pub relative_mouse_input: bool,
     /// TLS + Graphical login (legacy)
     ///
     /// Also called SSL or TLS security protocol.
@@ -287,6 +321,28 @@ pub struct Config {
     /// [\[MS-RDPBCGR\] 2.2.1.3.7]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/861f2bbb-6ca2-4c5a-8c44-0714fa901e70
     /// [`MultiTransportChannelData`]: ironrdp_pdu::gcc::MultiTransportChannelData
     pub multitransport_flags: Option<gcc::MultiTransportFlags>,
+
+    /// Advertise client support for the Remote Desktop Protocol: Graphics Pipeline Extension.
+    ///
+    /// When `true`, the connector sets `RNS_UD_CS_SUPPORT_DYNVC_GFX_PROTOCOL` in `earlyCapabilityFlags`.
+    /// [\[MS-RDPBCGR\] 2.2.1.3.2] defines this Client Core Data flag.
+    /// [\[MS-RDPEGFX\] 1.5.1] requires clients to advertise it before using EGFX.
+    ///
+    /// Enable this only after registering an EGFX-capable [`DvcClientProcessor`].
+    /// [`GraphicsPipelineClient`] provides IronRDP's implementation.
+    /// Register it with [`DrdynvcClient::with_dynamic_channel`].
+    /// Then attach the DRDYNVC client through [`ClientConnector::with_static_channel`].
+    /// Advertising the flag without a processor can make a server route graphics to an unhandled channel.
+    /// The desktop then remains blank.
+    ///
+    /// The default is `false`, so EGFX is not advertised.
+    ///
+    /// [\[MS-RDPBCGR\] 2.2.1.3.2]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/00f1da4a-ee9c-421a-852f-c19f92343d73
+    /// [\[MS-RDPEGFX\] 1.5.1]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/da5c75f9-cd99-450c-98c4-014a496942b0
+    /// [`DvcClientProcessor`]: https://docs.rs/ironrdp-dvc/latest/ironrdp_dvc/trait.DvcClientProcessor.html
+    /// [`DrdynvcClient::with_dynamic_channel`]: https://docs.rs/ironrdp-dvc/latest/ironrdp_dvc/struct.DrdynvcClient.html#method.with_dynamic_channel
+    /// [`GraphicsPipelineClient`]: https://docs.rs/ironrdp-egfx/latest/ironrdp_egfx/client/struct.GraphicsPipelineClient.html
+    pub support_dyn_vc_gfx_protocol: bool,
 }
 
 ironrdp_core::assert_impl!(Config: Send, Sync);
@@ -350,15 +406,52 @@ impl Written {
     }
 }
 
+/// A point on a monotonic millisecond clock owned by the I/O driver.
+///
+/// Lives in `ironrdp-core`, shared with `ironrdp-rdpeudp`, and re-exported
+/// here. The epoch is arbitrary and carries no meaning; only differences
+/// between two instants do. All instants passed to one connector across its
+/// lifetime must come from the same clock: comparing instants from two
+/// different epochs produces a meaningless delta rather than an error, either
+/// saturating to zero or landing on a huge value with no diagnostic.
+///
+/// The clock deliberately lives outside the sans-I/O sequences, because a
+/// sequence reading a clock itself would measure how quickly it drained an
+/// already-filled buffer rather than how long the bytes took to arrive. Only
+/// the driver that performed the read knows the latter, which is what the
+/// `None` in [`Sequence::step`] is for: a driver with no reading to pass on.
+/// `ironrdp-blocking` and `ironrdp-async` each stamp with their own
+/// driver-owned epoch; the FFI connector, which has no read loop of its own to
+/// time, stamps on entry to its `step` binding instead.
+pub use ironrdp_core::MonotonicInstant;
+
 pub trait Sequence: Send {
     fn next_pdu_hint(&self) -> Option<&dyn PduHint>;
 
     fn state(&self) -> &dyn State;
 
-    fn step(&mut self, input: &[u8], output: &mut WriteBuf) -> ConnectorResult<Written>;
+    /// Advances the sequence.
+    ///
+    /// `received_at` is when `input` arrived on the wire, as observed by the I/O
+    /// driver, or `None` from a driver that does not observe arrival times. The
+    /// absence of a reading is deliberately not expressible as an instant: a
+    /// driver that cannot measure has taken no measurement, which is a different
+    /// thing from one that measured no elapsed time, and only the sequence
+    /// knows which of the two its reply may be derived from.
+    ///
+    /// A driver that always passes `None` never opens a connect-time bandwidth
+    /// window, so the Bandwidth Measure Results it sends report only the Stop's
+    /// own payload against the untimed floor. See `connection::counted_len`'s doc
+    /// for why the byte count is measurement-gated rather than reported in full.
+    fn step(
+        &mut self,
+        input: &[u8],
+        received_at: Option<MonotonicInstant>,
+        output: &mut WriteBuf,
+    ) -> ConnectorResult<Written>;
 
     fn step_no_input(&mut self, output: &mut WriteBuf) -> ConnectorResult<Written> {
-        self.step(&[], output)
+        self.step(&[], None, output)
     }
 }
 

@@ -23,6 +23,7 @@ pub mod ffi {
     use crate::error::ValueConsumedError;
     use crate::error::ffi::{IronRdpError, IronRdpErrorKind};
     use crate::pdu::ffi::WriteBuf;
+    use crate::utils::monotonic_now;
 
     #[diplomat::opaque] // We must use Option here, as ClientConnector is not Clone and have functions that consume it
     pub struct ClientConnector(pub Option<ironrdp::connector::ClientConnector>);
@@ -54,6 +55,12 @@ pub mod ffi {
 
         // FIXME: We need to create opaque for ironrdp::rdpdr::Rdpdr
         /// Must use
+        ///
+        /// Announces a smartcard device. On Windows, calls are passed through to the local
+        /// WinSCard service; elsewhere every call fails with `SCARD_E_NO_SERVICE`.
+        ///
+        /// Some WinSCard calls complete asynchronously: call `ActiveStage::poll_rdpdr_deferred`
+        /// periodically to send their results to the server.
         pub fn with_static_channel_rdpdr(
             &mut self,
             computer_name: &str,
@@ -62,12 +69,24 @@ pub mod ffi {
             let Some(connector) = self.0.take() else {
                 return Err(ValueConsumedError::for_item("connector").into());
             };
-            self.0 = Some(
-                connector.with_static_channel(
-                    ironrdp::rdpdr::Rdpdr::new(Box::new(ironrdp::rdpdr::NoopRdpdrBackend {}), computer_name.to_owned())
-                        .with_smartcard(smart_card_device_id),
-                ),
+
+            #[cfg(windows)]
+            let backend: Box<dyn ironrdp::rdpdr::RdpdrBackend> = Box::new(
+                ironrdp_rdpdr_native::WindowsRdpdrBackendFactory::from_drives(Vec::new())
+                    .map_err(|error| {
+                        crate::error::GenericError(
+                            anyhow::Error::new(error).context("invalid RDPDR backend configuration"),
+                        )
+                    })?
+                    .with_smartcard(true)
+                    .build(),
             );
+            #[cfg(not(windows))]
+            let backend: Box<dyn ironrdp::rdpdr::RdpdrBackend> = Box::new(ironrdp::rdpdr::NoopRdpdrBackend);
+
+            self.0 = Some(connector.with_static_channel(
+                ironrdp::rdpdr::Rdpdr::new(backend, computer_name.to_owned()).with_smartcard(smart_card_device_id),
+            ));
 
             Ok(())
         }
@@ -193,7 +212,12 @@ pub mod ffi {
             let Some(connector) = self.0.as_mut() else {
                 return Err(ValueConsumedError::for_item("connector").into());
             };
-            let written = connector.step(input, &mut write_buf.0)?;
+            // The FFI surface has no parameter through which the .NET caller could pass
+            // when it read `input`, so this stamps on entry to the call instead. That is
+            // at least as accurate as the other drivers' `last_read_at`, which is also a
+            // post-read stamp taken right after the read completes rather than exactly
+            // when the first byte arrived.
+            let written = connector.step(input, Some(monotonic_now()), &mut write_buf.0)?;
             Ok(Box::new(Written(written)))
         }
 
@@ -226,6 +250,7 @@ pub mod ffi {
             Ok(connector.next_pdu_hint().map(PduHint).map(Box::new))
         }
 
+        #[diplomat::attr(auto, getter = "dyn_state")]
         pub fn get_dyn_state(&self) -> Result<Box<DynState<'_>>, Box<IronRdpError>> {
             let Some(connector) = self.0.as_ref() else {
                 return Err(ValueConsumedError::for_item("connector").into());
@@ -259,6 +284,7 @@ pub mod ffi {
     pub struct DynState<'a>(pub &'a dyn ironrdp::connector::State);
 
     impl<'a> DynState<'a> {
+        #[diplomat::attr(auto, getter = "name")]
         pub fn get_name(&'a self, writeable: &'a mut DiplomatWriteable) -> Result<(), Box<IronRdpError>> {
             let name = self.0.name();
             write!(writeable, "{name}")?;

@@ -1,4 +1,5 @@
 #![cfg_attr(doc, doc = include_str!("../README.md"))]
+#![doc(html_logo_url = "https://cdnweb.devolutions.net/images/projects/devolutions/logos/devolutions-icon-shadow.svg")]
 #![cfg_attr(not(feature = "std"), no_std)]
 
 extern crate alloc;
@@ -9,6 +10,7 @@ pub mod client;
 pub mod io;
 pub mod pdu;
 pub mod server;
+pub mod usb;
 
 /// Error returned when a per-device USB interface ID conflicts with an RDPEUSB default interface.
 ///
@@ -44,5 +46,27 @@ impl<T> core::fmt::Display for InvalidDeviceInterfaceId<T> {
         f.write_str(
             "invalid USB device interface id: conflicts with RDPEUSB default interfaces (expected id >= 0x00000004)",
         )
+    }
+}
+
+pub struct InterfaceAlloc {
+    id: u32,
+}
+
+impl Default for InterfaceAlloc {
+    fn default() -> Self {
+        Self { id: 3 }
+    }
+}
+
+impl InterfaceAlloc {
+    #[inline]
+    pub const fn alloc(&mut self) -> Option<pdu::header::InterfaceId> {
+        self.id += 1;
+        if self.id > 0x3F_FF_FF_FF {
+            None
+        } else {
+            Some(pdu::header::InterfaceId::from_raw(self.id))
+        }
     }
 }

@@ -56,8 +56,12 @@ internal static class ConnectionHelpers
 
         while (true)
         {
-            var generator = credsspSequence.ProcessTsRequest(tsRequest);
-            var clientState = await Connection.ResolveGenerator(generator, tcpClient);
+            ClientState clientState;
+            using (var generator = credsspSequence.ProcessTsRequest(tsRequest))
+            {
+                clientState = await Connection.ResolveGenerator(generator, tcpClient);
+            }
+
             writeBuf.Clear();
             var written = credsspSequence.HandleProcessResult(clientState, writeBuf);
 
@@ -115,6 +119,14 @@ internal static class ConnectionHelpers
         if (state.GetEnumType() == ClientConnectorStateType.Connected)
         {
             return state.GetConnectedResult();
+        }
+        else if (state.GetEnumType() == ClientConnectorStateType.Redirected)
+        {
+            // The redirecting server waits for the client to close this connection (MS-RDPBCGR 3.2.5.13.1).
+            // The connection sequence owns the framed stream alone: no session reader or writer exists yet.
+            var (stream, _) = framedSsl.GetInner();
+            stream.Dispose();
+            throw new ServerRedirectionException(state.GetRedirectedResult());
         }
         else
         {

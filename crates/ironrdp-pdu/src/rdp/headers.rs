@@ -16,6 +16,9 @@ use crate::rdp::finalization_messages::{ControlPdu, FontPdu, MonitorLayoutPdu, S
 use crate::rdp::multitransport::MultitransportRequestPdu;
 use crate::rdp::refresh_rectangle::RefreshRectanglePdu;
 use crate::rdp::server_error_info::ServerSetErrorInfoPdu;
+use crate::rdp::server_redirection::{
+    EnhancedSecurityServerRedirectionBody, ServerRedirectionPdu, decode_server_redirection,
+};
 use crate::rdp::session_info::SaveSessionInfoPdu;
 use crate::rdp::suppress_output::SuppressOutputPdu;
 
@@ -23,6 +26,9 @@ pub const BASIC_SECURITY_HEADER_SIZE: usize = 4;
 pub const SHARE_DATA_HEADER_COMPRESSION_MASK: u8 = 0xF;
 const SHARE_CONTROL_HEADER_MASK: u16 = 0xF;
 const SHARE_CONTROL_HEADER_SIZE: usize = 2 * 3 + 4;
+/// On-the-wire Share Control Header per MS-RDPBCGR 2.2.8.1.1.1.1: totalLength,
+/// pduType and pduSource. shareId is part of the individual PDU bodies.
+const SHARE_CONTROL_HEADER_WIRE_SIZE: usize = 2 * 3;
 
 const PROTOCOL_VERSION: u16 = 0x10;
 
@@ -208,6 +214,8 @@ pub enum IoChannelPdu {
     ///
     /// Received when the server wants the client to establish a sideband UDP transport.
     MultitransportRequest(MultitransportRequestPdu),
+    /// Server Redirection PDU, in either its Enhanced Security or Standard Security variant (MS-RDPBCGR 2.2.13).
+    ServerRedirection(ServerRedirectionPdu),
 }
 
 /// Decodes a PDU received on the RDP IO channel from the user data of a Send Data Indication.
@@ -232,10 +240,14 @@ pub fn decode_io_channel(ctx: SendDataIndicationCtx<'_>) -> DecodeResult<IoChann
         }
     }
 
-    let ctx = decode_share_control(ctx)?;
+    if let Some(redirection) = decode_server_redirection(ctx.user_data)? {
+        return Ok(IoChannelPdu::ServerRedirection(redirection));
+    }
 
+    let ctx = decode_share_control(ctx)?;
     match ctx.pdu {
         ShareControlPdu::ServerDeactivateAll(deactivate_all) => Ok(IoChannelPdu::DeactivateAll(deactivate_all)),
+        ShareControlPdu::ServerRedirect(redirection) => Ok(IoChannelPdu::ServerRedirection(redirection)),
         ShareControlPdu::Data(share_data_header) => {
             let share_data_ctx = ShareDataCtx {
                 initiator_id: ctx.initiator_id,
@@ -269,21 +281,28 @@ impl ShareControlHeader {
     const NAME: &'static str = "ShareControlHeader";
 
     const FIXED_PART_SIZE: usize = SHARE_CONTROL_HEADER_SIZE;
+
+    /// Whether a `shareId` field follows the header.
+    ///
+    /// The Enhanced Security Server Redirection PDU (MS-RDPBCGR 2.2.13.3.1) has none.
+    fn has_share_id(&self) -> bool {
+        !matches!(self.share_control_pdu, ShareControlPdu::ServerRedirect(_))
+    }
 }
 
 impl Encode for ShareControlHeader {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
         ensure_size!(in: dst, size: self.size());
 
-        let pdu_type_with_version = PROTOCOL_VERSION | self.share_control_pdu.share_header_type().as_u16();
+        let pdu_version = if self.has_share_id() { PROTOCOL_VERSION } else { 0 };
+        let pdu_type_with_version = pdu_version | self.share_control_pdu.share_header_type().as_u16();
 
-        dst.write_u16(cast_length!(
-            "len",
-            self.share_control_pdu.size() + SHARE_CONTROL_HEADER_SIZE
-        )?);
+        dst.write_u16(cast_length!("len", self.size(), in: dst)?);
         dst.write_u16(pdu_type_with_version);
         dst.write_u16(self.pdu_source);
-        dst.write_u32(self.share_id);
+        if self.has_share_id() {
+            dst.write_u32(self.share_id);
+        }
 
         self.share_control_pdu.encode(dst)
     }
@@ -293,25 +312,41 @@ impl Encode for ShareControlHeader {
     }
 
     fn size(&self) -> usize {
-        Self::FIXED_PART_SIZE + self.share_control_pdu.size()
+        let share_id_size = if self.has_share_id() {
+            4 /* shareId */
+        } else {
+            0
+        };
+        SHARE_CONTROL_HEADER_WIRE_SIZE + share_id_size + self.share_control_pdu.size()
     }
 }
 
 impl<'de> Decode<'de> for ShareControlHeader {
     fn decode(src: &mut ReadCursor<'de>) -> DecodeResult<Self> {
-        ensure_fixed_part_size!(in: src);
+        // The wire header is only 6 bytes (MS-RDPBCGR 2.2.8.1.1.1.1); shareId belongs
+        // to the PDU body. xrdp sends header-only Deactivate All PDUs without it.
+        ensure_size!(in: src, size: SHARE_CONTROL_HEADER_WIRE_SIZE);
 
         let total_length = usize::from(src.read_u16());
         let pdu_type_with_version = src.read_u16();
         let pdu_source = src.read_u16();
-        let share_id = src.read_u32();
 
         let pdu_type = ShareControlPduType::from_u16(pdu_type_with_version & SHARE_CONTROL_HEADER_MASK)
-            .ok_or_else(|| invalid_field_err!("pdu_type", "invalid pdu type"))?;
+            .ok_or_else(|| invalid_field_err!("pdu_type", "invalid pdu type", in: src))?;
         let pdu_version = pdu_type_with_version & !SHARE_CONTROL_HEADER_MASK;
-        if pdu_version != PROTOCOL_VERSION {
-            return Err(invalid_field_err!("pdu_version", "invalid PDU version"));
+        // The Enhanced Security Server Redirection PDU sets PDUVersion to zero and carries no shareId
+        // (MS-RDPBCGR 2.2.13.3.1).
+        let is_redirection = pdu_type == ShareControlPduType::ServerRedirect;
+        let expected_version = if is_redirection { 0 } else { PROTOCOL_VERSION };
+        if pdu_version != expected_version {
+            return Err(invalid_field_err!("pdu_version", "invalid PDU version", in: src));
         }
+
+        let share_id = if !is_redirection && src.len() >= 4 {
+            src.read_u32()
+        } else {
+            0
+        };
 
         let share_pdu = ShareControlPdu::from_type(src, pdu_type)?;
         let header = Self {
@@ -321,25 +356,41 @@ impl<'de> Decode<'de> for ShareControlHeader {
         };
 
         if pdu_type == ShareControlPduType::DataPdu {
+            // This is the re-encoded size, which differs from the received size for a supported
+            // header-only Server Font Map because decoding substitutes `FontPdu::default()`.
             let header_length = header.size();
 
-            let is_empty_output_pdu = matches!(
-                &header.share_control_pdu,
-                ShareControlPdu::Data(ShareDataHeader {
-                    share_data_pdu: ShareDataPdu::Update(data) | ShareDataPdu::Pointer(data),
-                    ..
-                }) if data.is_empty()
-            );
+            // An empty Update/Pointer PDU is a legitimate no-op carrying a zero length.
+            let is_zero_length_empty_output_pdu = total_length == 0
+                && matches!(
+                    &header.share_control_pdu,
+                    ShareControlPdu::Data(ShareDataHeader {
+                        share_data_pdu: ShareDataPdu::Update(data) | ShareDataPdu::Pointer(data),
+                        ..
+                    }) if data.is_empty()
+                );
 
-            if header_length != total_length && !(total_length == 0 && is_empty_output_pdu) {
-                if total_length < header_length {
-                    return Err(not_enough_bytes_err!(total_length, header_length));
-                }
+            // VirtualBox's VRDP declares only the two headers of a Server Font Map (18) and
+            // omits the 8-byte body from the declared length. Keep this exception to that exact
+            // declaration; this decoder is also used for untrusted client-to-server PDUs.
+            let is_header_length_font_map = total_length
+                == ShareControlHeader::FIXED_PART_SIZE + ShareDataHeader::FIXED_PART_SIZE
+                && matches!(
+                    &header.share_control_pdu,
+                    ShareControlPdu::Data(ShareDataHeader {
+                        share_data_pdu: ShareDataPdu::FontMap(_),
+                        ..
+                    })
+                );
 
-                // Some Windows versions append padding that is not part of the inner unit.
+            if total_length > header_length {
+                // Over-declared: some Windows versions append padding past the inner unit.
+                // Unchanged, and still bounded by `ensure_size!`.
                 let padding = total_length - header_length;
                 ensure_size!(in: src, size: padding);
                 read_padding!(src, padding);
+            } else if total_length < header_length && !is_header_length_font_map && !is_zero_length_empty_output_pdu {
+                return Err(not_enough_bytes_err!(total_length, header_length));
             }
         }
 
@@ -354,6 +405,8 @@ pub enum ShareControlPdu {
     ClientConfirmActive(ClientConfirmActive),
     Data(ShareDataHeader),
     ServerDeactivateAll(ServerDeactivateAll),
+    /// Enhanced Security Server Redirection PDU (MS-RDPBCGR 2.2.13.3.1).
+    ServerRedirect(ServerRedirectionPdu),
 }
 
 impl ShareControlPdu {
@@ -365,6 +418,7 @@ impl ShareControlPdu {
             ShareControlPdu::ClientConfirmActive(_) => "Client Confirm Active PDU",
             ShareControlPdu::Data(_) => "Data PDU",
             ShareControlPdu::ServerDeactivateAll(_) => "Server Deactivate All PDU",
+            ShareControlPdu::ServerRedirect(_) => "Enhanced Security Server Redirection PDU",
         }
     }
 
@@ -374,6 +428,7 @@ impl ShareControlPdu {
             ShareControlPdu::ClientConfirmActive(_) => ShareControlPduType::ConfirmActivePdu,
             ShareControlPdu::Data(_) => ShareControlPduType::DataPdu,
             ShareControlPdu::ServerDeactivateAll(_) => ShareControlPduType::DeactivateAllPdu,
+            ShareControlPdu::ServerRedirect(_) => ShareControlPduType::ServerRedirect,
         }
     }
 
@@ -389,7 +444,9 @@ impl ShareControlPdu {
             ShareControlPduType::DeactivateAllPdu => {
                 Ok(ShareControlPdu::ServerDeactivateAll(ServerDeactivateAll::decode(src)?))
             }
-            _ => Err(invalid_field_err!("share_type", "unexpected share control PDU type")),
+            ShareControlPduType::ServerRedirect => Ok(ShareControlPdu::ServerRedirect(
+                EnhancedSecurityServerRedirectionBody::decode(src)?,
+            )),
         }
     }
 }
@@ -401,6 +458,9 @@ impl Encode for ShareControlPdu {
             ShareControlPdu::ClientConfirmActive(pdu) => pdu.encode(dst),
             ShareControlPdu::Data(share_data_header) => share_data_header.encode(dst),
             ShareControlPdu::ServerDeactivateAll(deactivate_all) => deactivate_all.encode(dst),
+            ShareControlPdu::ServerRedirect(redirection) => {
+                EnhancedSecurityServerRedirectionBody::encode(redirection, dst)
+            }
         }
     }
 
@@ -414,6 +474,7 @@ impl Encode for ShareControlPdu {
             ShareControlPdu::ClientConfirmActive(pdu) => pdu.size(),
             ShareControlPdu::Data(share_data_header) => share_data_header.size(),
             ShareControlPdu::ServerDeactivateAll(deactivate_all) => deactivate_all.size(),
+            ShareControlPdu::ServerRedirect(redirection) => EnhancedSecurityServerRedirectionBody::size(redirection),
         }
     }
 }
@@ -447,7 +508,7 @@ impl Encode for ShareDataHeader {
 
             write_padding!(dst, 1);
             dst.write_u8(self.stream_priority.as_u8());
-            dst.write_u16(cast_length!("uncompressedLength", self.share_data_pdu.size())?);
+            dst.write_u16(cast_length!("uncompressedLength", self.share_data_pdu.size(), in: dst)?);
             dst.write_u8(self.share_data_pdu.share_header_type().as_u8());
             dst.write_u8(compression_flags_with_type);
             dst.write_u16(0); // compressed length
@@ -473,17 +534,17 @@ impl<'de> Decode<'de> for ShareDataHeader {
 
         read_padding!(src, 1);
         let stream_priority = StreamPriority::from_u8(src.read_u8())
-            .ok_or_else(|| invalid_field_err!("streamPriority", "Invalid stream priority"))?;
+            .ok_or_else(|| invalid_field_err!("streamPriority", "Invalid stream priority", in: src))?;
         let _uncompressed_length = src.read_u16();
         let pdu_type = ShareDataPduType::from_u8(src.read_u8())
-            .ok_or_else(|| invalid_field_err!("pduType", "Invalid pdu type"))?;
+            .ok_or_else(|| invalid_field_err!("pduType", "Invalid pdu type", in: src))?;
         let compression_flags_with_type = src.read_u8();
 
         let compression_flags =
             CompressionFlags::from_bits_retain(compression_flags_with_type & !SHARE_DATA_HEADER_COMPRESSION_MASK);
         let compression_type =
             client_info::CompressionType::from_u8(compression_flags_with_type & SHARE_DATA_HEADER_COMPRESSION_MASK)
-                .ok_or_else(|| invalid_field_err!("compressionType", "Invalid compression type"))?;
+                .ok_or_else(|| invalid_field_err!("compressionType", "Invalid compression type", in: src))?;
         let _compressed_length = src.read_u16();
 
         let share_data_pdu = if compression_flags.is_empty() {
@@ -932,6 +993,21 @@ mod tests {
     }
 
     #[test]
+    fn reject_nonzero_under_declared_empty_output_data_pdu() {
+        for pdu_type in [0x02, 0x1B] {
+            for total_length in 1u16..18 {
+                let mut encoded = zero_length_empty_data_pdu(pdu_type);
+                encoded[..2].copy_from_slice(&total_length.to_le_bytes());
+
+                assert!(
+                    decode::<ShareControlHeader>(&encoded).is_err(),
+                    "accepted PDU type {pdu_type:#04x} with totalLength {total_length}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn reject_zero_length_non_output_data_pdu() {
         let encoded = zero_length_empty_data_pdu(0x25);
 
@@ -942,9 +1018,69 @@ mod tests {
             error.kind(),
             ironrdp_core::DecodeErrorKind::NotEnoughBytes {
                 received: 0,
-                expected: 18
+                expected: 18,
+                ..
             }
         ));
+    }
+
+    /// The under-declaration carve-out must not extend past the Server Font Map case.
+    ///
+    /// A `ShutdownDenied` PDU is header-only, so 18 bytes were read; declaring 17 is neither
+    /// self-consistent with the wire nor the VRDP Font Map, and MS-RDPBCGR 3.2.5.2 asks for it
+    /// to be rejected. Guards the exact example raised in review — "a header-only PDU declared
+    /// with 1–17 bytes" — which an earlier revision of this check accepted.
+    #[test]
+    fn reject_under_declared_non_output_data_pdu() {
+        let mut encoded = zero_length_empty_data_pdu(0x25);
+        encoded[0] = 17;
+
+        let error = decode::<ShareControlHeader>(&encoded)
+            .expect_err("an under-declared length is only tolerated for a Server Font Map");
+
+        assert!(matches!(
+            error.kind(),
+            ironrdp_core::DecodeErrorKind::NotEnoughBytes {
+                received: 17,
+                expected: 18,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn decode_short_deactivate_all_pdu() {
+        let encoded = [
+            0x06, 0x00, // totalLength (6 - header only, no shareId)
+            0x16, 0x00, // pduType (Deactivate All) + protocolVersion
+            0xE9, 0x03, // pduSource
+        ];
+
+        let decoded: ShareControlHeader = decode(&encoded).expect("header-only Deactivate All PDU");
+
+        assert!(matches!(
+            decoded.share_control_pdu,
+            ShareControlPdu::ServerDeactivateAll(_)
+        ));
+        assert_eq!(decoded.share_id, 0);
+    }
+
+    #[test]
+    fn decode_deactivate_all_pdu_with_share_id() {
+        let encoded = [
+            0x0A, 0x00, // totalLength (10 - header with shareId)
+            0x16, 0x00, // pduType (Deactivate All) + protocolVersion
+            0xE9, 0x03, // pduSource
+            0xDD, 0xCC, 0xBB, 0xAA, // shareId
+        ];
+
+        let decoded: ShareControlHeader = decode(&encoded).expect("full-length Deactivate All PDU");
+
+        assert!(matches!(
+            decoded.share_control_pdu,
+            ShareControlPdu::ServerDeactivateAll(_)
+        ));
+        assert_eq!(decoded.share_id, 0xAABB_CCDD);
     }
 
     #[test]

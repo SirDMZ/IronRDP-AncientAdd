@@ -1,7 +1,9 @@
+mod active_stage;
 mod autodetect;
 mod connection_activation;
 mod fast_path;
-mod rfx;
+mod heartbeat;
+pub(crate) mod rfx;
 mod save_session_info;
 
 #[cfg(test)]

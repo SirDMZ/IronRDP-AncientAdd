@@ -41,7 +41,7 @@ pub trait DeviceManagerBackend: Send {
 pub struct UrbdrcListener {
     on_capability_exchanged: Option<OnCapabilityExchanged>,
     device_man: Box<dyn DeviceManagerBackend>,
-    iface_man: InterfaceAlloc,
+    iface_man: crate::InterfaceAlloc,
 }
 
 impl UrbdrcListener {
@@ -49,28 +49,7 @@ impl UrbdrcListener {
         Self {
             on_capability_exchanged: Some(callback),
             device_man,
-            iface_man: InterfaceAlloc::new(),
-        }
-    }
-}
-
-struct InterfaceAlloc {
-    id: u32,
-}
-
-impl InterfaceAlloc {
-    #[inline]
-    const fn new() -> Self {
-        Self { id: 3 }
-    }
-
-    #[inline]
-    const fn alloc(&mut self) -> Option<InterfaceId> {
-        self.id += 1;
-        if self.id > 0x3F_FF_FF_FF {
-            None
-        } else {
-            Some(InterfaceId::from_raw(self.id))
+            iface_man: crate::InterfaceAlloc::default(),
         }
     }
 }
@@ -85,12 +64,14 @@ impl DvcChannelListener for UrbdrcListener {
             self.device_man.control_channel_assigned(channel_id);
             Some(Box::new(UrbdrcControlClient::new(callback)))
         } else {
+            // Take the device first, so that a channel without one does not use up an interface ID.
+            let backend = self.device_man.take_device_for_channel(channel_id)?;
             let udev_iface = self.iface_man.alloc()?;
             #[expect(clippy::as_conversions)]
-            self.device_man.take_device_for_channel(channel_id).map(|backend| {
+            Some(
                 Box::new(UrbdrcDeviceClient::new(udev_iface, backend).expect("invalid interface id"))
-                    as Box<dyn DvcClientProcessor>
-            })
+                    as Box<dyn DvcClientProcessor>,
+            )
         }
     }
 }
@@ -203,6 +184,10 @@ pub trait UrbdrcDeviceBackend: Send {
     /// the CANCEL_REQUEST message. If the current request has not been completed it MUST be
     /// canceled. If the request has been completed, the client MUST ignore this CANCEL_REQUEST
     /// message.
+    ///
+    /// The request stays pending: the backend still completes it through the matching completion
+    /// method on [`UrbdrcDeviceClient`], with `USBD_STATUS_CANCELED` when it was stopped, so that the
+    /// server-side IRP finishes. FreeRDP completes cancelled transfers the same way.
     ///
     /// [3.3.5.3.1]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpeusb/d5315234-d9ba-42dc-bc1b-b421c57a21ae
     fn cancel_request(&mut self, request_id: RequestId, channel_id: u32);
@@ -523,6 +508,11 @@ impl DvcProcessor for UrbdrcDeviceClient {
 
         use UrbdrcServerDevicePdu::*;
         match pdu {
+            Caps(caps_req_pdu) => Ok(vec![Box::new(RimExchangeCapabilityResponse {
+                msg_id: caps_req_pdu.msg_id,
+                capability: Capability::RimCapabilityVersion01,
+                result: 0,
+            })]),
             ChanCreated(chan_created_pdu) => Ok(vec![Box::new(ChannelCreated {
                 msg_id: chan_created_pdu.msg_id,
                 direction: crate::pdu::notify::Direction::ToServer,
@@ -558,7 +548,8 @@ impl DvcProcessor for UrbdrcDeviceClient {
                 if !self.ready_for_io || cancel_req_pdu.udev_iface != self.udev_iface {
                     return Ok(Vec::new());
                 }
-                if self.pending_io.remove(&cancel_req_pdu.req_id).is_some() {
+                // The request stays pending until the backend completes it, as cancelled or not.
+                if self.pending_io.contains_key(&cancel_req_pdu.req_id) {
                     self.backend.cancel_request(cancel_req_pdu.req_id, channel_id);
                 }
                 Ok(Vec::new())

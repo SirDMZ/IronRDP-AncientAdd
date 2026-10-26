@@ -225,7 +225,7 @@ fn build_config(
         enable_tls: false, // This example does not expose any frontend.
         enable_credssp: true,
         enable_standard_rdp_security: false,
-        keyboard_type: KeyboardType::IbmEnhanced,
+        keyboard_type: KeyboardType::IBM_ENHANCED,
         keyboard_subtype: 0,
         keyboard_layout: 0,
         keyboard_functional_keys_count: 12,
@@ -236,6 +236,7 @@ fn build_config(
             width: 1280,
             height: 1024,
         },
+        monitor_layout: None,
         bitmap: None,
         client_build: 0,
         client_name: "ironrdp-screenshot-example".to_owned(),
@@ -268,8 +269,14 @@ fn build_config(
         compression_type,
         pointer_software_rendering: true,
         multitransport_flags: None,
+        support_dyn_vc_gfx_protocol: false,
         performance_flags: PerformanceFlags::default(),
         desktop_scale_factor: 0,
+        desktop_physical_size: None,
+        desktop_orientation: None,
+        device_scale_factor: None,
+        monitor_extended_layout: None,
+        relative_mouse_input: false,
         hardware_id: None,
         license_cache: None,
         timezone_info: TimezoneInfo::default(),
@@ -339,6 +346,7 @@ fn connect(
         server_public_key,
         None,
     )
+    .and_then(connector::ConnectionOutcome::into_connected)
     .context("finalize connection")?;
 
     Ok((connection_result, upgraded_framed))
@@ -370,7 +378,7 @@ fn active_stage(
 
         trace!(?action, frame_length = payload.len(), "Frame received");
 
-        let outputs = active_stage.process(image, action, &payload)?;
+        let outputs = active_stage.process(image, action, &payload, framed.last_read_at())?;
 
         for out in outputs {
             match out {

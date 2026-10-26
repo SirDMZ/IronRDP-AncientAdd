@@ -50,6 +50,13 @@ const BIAS_SIZE: usize = 4;
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct ClientInfo {
     pub credentials: Credentials,
+    /// Opaque password cookie sent verbatim in the `Password` field instead of `credentials.password`.
+    ///
+    /// A Server Redirection PDU can carry such a cookie for the target server ([MS-RDPBCGR] 2.2.13.1).
+    /// Decoding fills it when the `Password` field is not valid text.
+    ///
+    /// [MS-RDPBCGR]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/
+    pub password_cookie: Option<PasswordCookie>,
     pub code_page: u32,
     pub flags: ClientInfoFlags,
     pub compression_type: CompressionType,
@@ -60,6 +67,14 @@ pub struct ClientInfo {
 
 impl ClientInfo {
     const NAME: &'static str = "ClientInfo";
+
+    /// Length of the `Password` field, excluding its null terminator.
+    fn password_len(&self, character_set: CharacterSet) -> usize {
+        match &self.password_cookie {
+            Some(cookie) => cookie.0.len(),
+            None => string_len(self.credentials.password.as_str(), character_set),
+        }
+    }
 
     pub const FIXED_PART_SIZE: usize = CODE_PAGE_SIZE
         + FLAGS_SIZE
@@ -88,28 +103,27 @@ impl Encode for ClientInfo {
         let domain = self.credentials.domain.clone().unwrap_or_default();
         dst.write_u16(cast_length!(
             "domain length",
-            string_len(domain.as_str(), character_set)
-        )?);
+            string_len(domain.as_str(), character_set), in: dst)?);
         dst.write_u16(cast_length!(
             "username length",
-            string_len(self.credentials.username.as_str(), character_set)
-        )?);
-        dst.write_u16(cast_length!(
-            "password length",
-            string_len(self.credentials.password.as_str(), character_set)
-        )?);
+            string_len(self.credentials.username.as_str(), character_set), in: dst)?);
+        dst.write_u16(cast_length!("password length", self.password_len(character_set), in: dst)?);
         dst.write_u16(cast_length!(
             "alternate shell length",
-            string_len(self.alternate_shell.as_str(), character_set)
-        )?);
+            string_len(self.alternate_shell.as_str(), character_set), in: dst)?);
         dst.write_u16(cast_length!(
             "work dir length",
-            string_len(self.work_dir.as_str(), character_set)
-        )?);
+            string_len(self.work_dir.as_str(), character_set), in: dst)?);
 
         utils::write_string_to_cursor(dst, domain.as_str(), character_set, true)?;
         utils::write_string_to_cursor(dst, self.credentials.username.as_str(), character_set, true)?;
-        utils::write_string_to_cursor(dst, self.credentials.password.as_str(), character_set, true)?;
+        match &self.password_cookie {
+            Some(cookie) => {
+                dst.write_slice(&cookie.0);
+                write_padding!(dst, usize::from(character_set.as_u16()));
+            }
+            None => utils::write_string_to_cursor(dst, self.credentials.password.as_str(), character_set, true)?,
+        }
         utils::write_string_to_cursor(dst, self.alternate_shell.as_str(), character_set, true)?;
         utils::write_string_to_cursor(dst, self.work_dir.as_str(), character_set, true)?;
 
@@ -139,7 +153,7 @@ impl Encode for ClientInfo {
             + WORK_DIR_LENGTH_SIZE
             + string_len(domain.as_str(), character_set)
                 + string_len(self.credentials.username.as_str(), character_set)
-                + string_len(self.credentials.password.as_str(), character_set)
+                + self.password_len(character_set)
                 + string_len(self.alternate_shell.as_str(), character_set)
                 + string_len(self.work_dir.as_str(), character_set)
             + usize::from(character_set.as_u16()) * 5 // null terminator
@@ -154,10 +168,15 @@ impl<'de> Decode<'de> for ClientInfo {
         let code_page = src.read_u32();
         let flags_with_compression_type = src.read_u32();
 
-        let flags = ClientInfoFlags::from_bits(flags_with_compression_type & !COMPRESSION_TYPE_MASK)
-            .ok_or_else(|| invalid_field_err!("flags", "invalid ClientInfoFlags"))?;
+        // [MS-RDPBCGR] 3.3.5.3.11 asks the server to validate lengths and to
+        // test the UNICODE flag, never to validate this bit set, and the
+        // INFO_* list has grown several times; refusing unknown bits would
+        // reject newer clients at the login step. Retain them instead
+        // (crate-wide policy since #1144) so re-encoding preserves the wire
+        // value.
+        let flags = ClientInfoFlags::from_bits_retain(flags_with_compression_type & !COMPRESSION_TYPE_MASK);
         let compression_type = CompressionType::from_u32((flags_with_compression_type & COMPRESSION_TYPE_MASK) >> 9)
-            .ok_or_else(|| invalid_field_err!("flags", "invalid CompressionType"))?;
+            .ok_or_else(|| invalid_field_err!("flags", "invalid CompressionType", in: src))?;
 
         let character_set = if flags.contains(ClientInfoFlags::UNICODE) {
             CharacterSet::Unicode
@@ -176,7 +195,14 @@ impl<'de> Decode<'de> for ClientInfo {
 
         let domain = utils::decode_string(src.read_slice(domain_size), character_set, true)?;
         let username = utils::decode_string(src.read_slice(user_name_size), character_set, true)?;
-        let password = utils::decode_string(src.read_slice(password_size), character_set, true)?;
+        let password_field = src.read_slice(password_size);
+        let raw_password = &password_field[..password_size - nt];
+        // A password cookie is opaque binary data. The field holds a password only when its text encodes back to the
+        // same bytes: a cookie can contain null code units, invalid text, or end with its own null terminator.
+        let (password, password_cookie) = match utils::decode_string(password_field, character_set, true) {
+            Ok(password) if is_encoded_text(raw_password, &password, character_set) => (password, None),
+            _ => (String::new(), Some(PasswordCookie(raw_password.to_vec()))),
+        };
 
         let domain = if domain.is_empty() { None } else { Some(domain) };
         let credentials = Credentials {
@@ -192,6 +218,7 @@ impl<'de> Decode<'de> for ClientInfo {
 
         Ok(Self {
             credentials,
+            password_cookie,
             code_page,
             flags,
             compression_type,
@@ -199,6 +226,18 @@ impl<'de> Decode<'de> for ClientInfo {
             work_dir,
             extra_info,
         })
+    }
+}
+
+/// Opaque password cookie, such as the one a Server Redirection PDU provides for the target server.
+#[derive(Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+pub struct PasswordCookie(pub Vec<u8>);
+
+impl fmt::Debug for PasswordCookie {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // NOTE: do not show the secret.
+        f.debug_struct("PasswordCookie").field("len", &self.0.len()).finish()
     }
 }
 
@@ -261,8 +300,9 @@ impl ExtendedClientInfo {
     fn encode(&self, dst: &mut WriteCursor<'_>, character_set: CharacterSet) -> EncodeResult<()> {
         ensure_size!(in: dst, size: self.size(character_set));
 
-        let address_string_len: u16 = cast_length!("address length", string_len(self.address.as_str(), character_set))?;
-        let dir_string_len: u16 = cast_length!("dir length", string_len(self.dir.as_str(), character_set))?;
+        let address_string_len: u16 =
+            cast_length!("address length", string_len(self.address.as_str(), character_set), in: dst)?;
+        let dir_string_len: u16 = cast_length!("dir length", string_len(self.dir.as_str(), character_set), in: dst)?;
 
         dst.write_u16(self.address_family.as_u16());
         // // + size of null terminator, which will write in the write_string function
@@ -427,14 +467,20 @@ impl<'de> Decode<'de> for ClientAutoReconnect {
     fn decode(src: &mut ReadCursor<'de>) -> DecodeResult<Self> {
         ensure_fixed_part_size!(in: src);
 
+        let cb_len_pos = src.pos();
         let packet_length = src.read_u32();
         if packet_length != RECONNECT_COOKIE_CB_LEN {
-            return Err(invalid_field_err!("cbLen", "invalid auto-reconnect packet size"));
+            return Err(invalid_field_err!(
+                "cbLen",
+                "invalid auto-reconnect packet size",
+                at: cb_len_pos
+            ));
         }
 
+        let version_pos = src.pos();
         let version = src.read_u32();
         if version != RECONNECT_COOKIE_VERSION {
-            return Err(invalid_field_err!("Version", "invalid auto-reconnect version"));
+            return Err(invalid_field_err!("Version", "invalid auto-reconnect version", at: version_pos));
         }
 
         let logon_id = src.read_u32();
@@ -573,7 +619,7 @@ impl<'de> Decode<'de> for ExtendedClientOptionalInfo {
         }
         optional_data.performance_flags = Some(
             PerformanceFlags::from_bits(src.read_u32())
-                .ok_or_else(|| invalid_field_err!("performanceFlags", "invalid performance flags"))?,
+                .ok_or_else(|| invalid_field_err!("performanceFlags", "invalid performance flags", in: src))?,
         );
 
         if src.len() < 2 {
@@ -583,11 +629,11 @@ impl<'de> Decode<'de> for ExtendedClientOptionalInfo {
         if reconnect_cookie_size != u16::try_from(RECONNECT_COOKIE_LEN).expect("RECONNECT_COOKIE_LEN fit into u16")
             && reconnect_cookie_size != 0
         {
-            return Err(invalid_field_err!("cbAutoReconnectCookie", "invalid cookie size"));
+            return Err(invalid_field_err!("cbAutoReconnectCookie", "invalid cookie size", in: src));
         }
         if reconnect_cookie_size != 0 {
             if src.len() < RECONNECT_COOKIE_LEN {
-                return Err(invalid_field_err!("cbAutoReconnectCookie", "missing cookie data"));
+                return Err(invalid_field_err!("cbAutoReconnectCookie", "missing cookie data", in: src));
             }
             let reconnect_cookie = src.read_array();
             optional_data.auto_reconnect = ClientAutoReconnect::decode(&mut ReadCursor::new(&reconnect_cookie)).ok();
@@ -966,6 +1012,17 @@ impl CompressionType {
     )]
     pub fn as_u8(self) -> u8 {
         self as u8
+    }
+}
+
+/// Whether `encoded` is exactly `value` in `character_set`, without a null terminator.
+fn is_encoded_text(encoded: &[u8], value: &str, character_set: CharacterSet) -> bool {
+    match character_set {
+        CharacterSet::Ansi => encoded == value.as_bytes(),
+        CharacterSet::Unicode => encoded
+            .iter()
+            .copied()
+            .eq(value.encode_utf16().flat_map(u16::to_le_bytes)),
     }
 }
 

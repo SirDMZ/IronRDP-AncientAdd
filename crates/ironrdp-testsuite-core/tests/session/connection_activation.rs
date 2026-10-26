@@ -2,7 +2,8 @@ use std::borrow::Cow;
 
 use ironrdp_connector::connection_activation::{ConnectionActivationSequence, ConnectionActivationState};
 use ironrdp_connector::{
-    ClientConnector, ClientConnectorState, Credentials, DesktopSize, MultitransportResult, Sequence as _, Written,
+    ClientConnector, ClientConnectorState, ConnectionOutcome, Credentials, DesktopSize, MultitransportResult,
+    Sequence as _, Written,
 };
 use ironrdp_core::{WriteBuf, decode, encode_vec};
 use ironrdp_pdu::gcc;
@@ -15,7 +16,10 @@ use ironrdp_pdu::rdp::headers::{
 };
 use ironrdp_pdu::rdp::multitransport::{MultitransportRequestPdu, MultitransportResponsePdu, RequestedProtocol};
 use ironrdp_pdu::rdp::server_error_info::{ErrorInfo, ProtocolIndependentCode, ServerSetErrorInfoPdu};
+use ironrdp_pdu::rdp::server_redirection::{ServerRedirectionFlags, ServerRedirectionPdu};
 use ironrdp_pdu::x224::X224;
+use ironrdp_session::x224::{Processor, ProcessorOutput};
+use ironrdp_svc::StaticChannelSet;
 
 use ironrdp_testsuite_core::capsets::SERVER_DEMAND_ACTIVE;
 
@@ -30,7 +34,13 @@ fn test_config() -> ironrdp_connector::Config {
             width: 1024,
             height: 768,
         },
+        monitor_layout: None,
         desktop_scale_factor: 0,
+        desktop_physical_size: None,
+        desktop_orientation: None,
+        device_scale_factor: None,
+        monitor_extended_layout: None,
+        relative_mouse_input: false,
         enable_tls: true,
         enable_credssp: false,
         enable_standard_rdp_security: false,
@@ -41,7 +51,7 @@ fn test_config() -> ironrdp_connector::Config {
         domain: None,
         client_build: 0,
         client_name: "test".into(),
-        keyboard_type: gcc::KeyboardType::IbmEnhanced,
+        keyboard_type: gcc::KeyboardType::IBM_ENHANCED,
         keyboard_subtype: 0,
         keyboard_layout: 0,
         keyboard_functional_keys_count: 12,
@@ -61,6 +71,7 @@ fn test_config() -> ironrdp_connector::Config {
         enable_server_pointer: false,
         pointer_software_rendering: false,
         multitransport_flags: None,
+        support_dyn_vc_gfx_protocol: false,
         performance_flags: Default::default(),
         timezone_info: Default::default(),
         alternate_shell: String::new(),
@@ -106,7 +117,7 @@ fn demand_active_static_channel_chunk_size(chunk_size: Option<u32>) -> usize {
     let mut output = WriteBuf::new();
     let frame = encode_server_share_control(ShareControlPdu::ServerDemandActive(demand_active));
     sequence
-        .step(&frame, &mut output)
+        .step(&frame, None, &mut output)
         .expect("demand active should be accepted");
 
     match sequence.connection_activation_state() {
@@ -153,7 +164,7 @@ fn deactivate_all_during_capabilities_exchange_stays_in_same_state() {
     let frame = encode_server_share_control(ShareControlPdu::ServerDeactivateAll(ServerDeactivateAll));
     let mut output = WriteBuf::new();
 
-    let written = seq.step(&frame, &mut output).unwrap();
+    let written = seq.step(&frame, None, &mut output).unwrap();
 
     assert_eq!(written, Written::Nothing);
     assert!(
@@ -176,7 +187,7 @@ fn client_connector_stays_in_capabilities_exchange_on_deactivate_all() {
     let frame = encode_server_share_control(ShareControlPdu::ServerDeactivateAll(ServerDeactivateAll));
     let mut output = WriteBuf::new();
 
-    let written = connector.step(&frame, &mut output).unwrap();
+    let written = connector.step(&frame, None, &mut output).unwrap();
 
     assert_eq!(written, Written::Nothing);
     assert!(
@@ -206,7 +217,7 @@ fn set_error_info_during_capabilities_exchange_surfaces_the_disconnect_reason() 
     let mut output = WriteBuf::new();
 
     let err = seq
-        .step(&frame, &mut output)
+        .step(&frame, None, &mut output)
         .expect_err("a Set Error Info PDU during capabilities exchange must end the sequence with an error");
 
     let message = err.to_string();
@@ -239,7 +250,7 @@ fn none_error_info_during_capabilities_exchange_is_skipped() {
     let frame = encode_server_share_control(none_error_info);
     let mut output = WriteBuf::new();
 
-    let written = seq.step(&frame, &mut output).unwrap();
+    let written = seq.step(&frame, None, &mut output).unwrap();
 
     assert_eq!(written, Written::Nothing);
     assert!(
@@ -259,13 +270,13 @@ fn demand_active_after_deactivate_all_transitions_to_connection_finalization() {
 
     // First: feed DeactivateAll
     let deactivate_frame = encode_server_share_control(ShareControlPdu::ServerDeactivateAll(ServerDeactivateAll));
-    let written = seq.step(&deactivate_frame, &mut output).unwrap();
+    let written = seq.step(&deactivate_frame, None, &mut output).unwrap();
     assert_eq!(written, Written::Nothing);
 
     // Then: feed ServerDemandActive
     let demand_active_frame =
         encode_server_share_control(ShareControlPdu::ServerDemandActive(SERVER_DEMAND_ACTIVE.clone()));
-    let written = seq.step(&demand_active_frame, &mut output).unwrap();
+    let written = seq.step(&demand_active_frame, None, &mut output).unwrap();
 
     assert!(written != Written::Nothing, "should have written ClientConfirmActive");
     assert!(
@@ -286,7 +297,7 @@ fn demand_active_captures_server_input_flags() {
     let mut output = WriteBuf::new();
 
     let frame = encode_server_share_control(ShareControlPdu::ServerDemandActive(SERVER_DEMAND_ACTIVE.clone()));
-    seq.step(&frame, &mut output).unwrap();
+    seq.step(&frame, None, &mut output).unwrap();
 
     match seq.connection_activation_state() {
         ConnectionActivationState::ConnectionFinalization { input_flags, .. } => {
@@ -315,7 +326,7 @@ fn demand_active_without_input_capability_yields_empty_input_flags() {
         .retain(|c| !matches!(c, CapabilitySet::Input(_)));
 
     let frame = encode_server_share_control(ShareControlPdu::ServerDemandActive(demand_active));
-    seq.step(&frame, &mut output).unwrap();
+    seq.step(&frame, None, &mut output).unwrap();
 
     match seq.connection_activation_state() {
         ConnectionActivationState::ConnectionFinalization { input_flags, .. } => {
@@ -393,13 +404,35 @@ fn multitransport_request_is_surfaced_without_waiting_for_another_pdu() {
     );
     let mut output = WriteBuf::new();
 
-    connector.step(&frame, &mut output).unwrap();
+    connector.step(&frame, None, &mut output).unwrap();
 
     assert!(
         connector.should_perform_multitransport(),
         "the request must be surfaced on arrival, not held pending a following PDU"
     );
     assert_eq!(connector.multitransport_request().unwrap().request_id, 1);
+}
+
+#[test]
+fn active_processor_surfaces_multitransport_request_on_message_channel() {
+    let request = multitransport_request(42, RequestedProtocol::UdpFecR);
+    let frame = encode_server_multitransport_request(&request, MESSAGE_CHANNEL_ID);
+    let mut processor = Processor::new(
+        StaticChannelSet::new(),
+        USER_CHANNEL_ID,
+        IO_CHANNEL_ID,
+        Some(MESSAGE_CHANNEL_ID),
+        SHARE_ID,
+    );
+
+    let outputs = processor
+        .process(&frame, &mut None, None)
+        .expect("active processor should surface multitransport request");
+
+    assert!(matches!(
+        outputs.as_slice(),
+        [ProcessorOutput::MultitransportRequest(decoded)] if decoded == &request
+    ));
 }
 
 #[test]
@@ -415,7 +448,7 @@ fn responding_returns_to_bootstrapping_for_the_next_request() {
             &multitransport_request(request_id, RequestedProtocol::UdpFecR),
             MESSAGE_CHANNEL_ID,
         );
-        connector.step(&frame, &mut output).unwrap();
+        connector.step(&frame, None, &mut output).unwrap();
         assert!(connector.should_perform_multitransport());
         assert_eq!(connector.multitransport_request().unwrap().request_id, request_id);
 
@@ -444,7 +477,7 @@ fn third_multitransport_request_is_rejected() {
             &multitransport_request(request_id, RequestedProtocol::UdpFecR),
             MESSAGE_CHANNEL_ID,
         );
-        connector.step(&frame, &mut output).unwrap();
+        connector.step(&frame, None, &mut output).unwrap();
         connector
             .complete_multitransport(MultitransportResult::Success, &mut output)
             .unwrap();
@@ -454,7 +487,7 @@ fn third_multitransport_request_is_rejected() {
         &multitransport_request(3, RequestedProtocol::UdpFecR),
         MESSAGE_CHANNEL_ID,
     );
-    assert!(connector.step(&frame, &mut output).is_err());
+    assert!(connector.step(&frame, None, &mut output).is_err());
 }
 
 #[test]
@@ -465,7 +498,7 @@ fn demand_active_on_the_io_channel_ends_bootstrapping() {
     let frame = encode_server_share_control(ShareControlPdu::ServerDemandActive(SERVER_DEMAND_ACTIVE.clone()));
     let mut output = WriteBuf::new();
 
-    connector.step(&frame, &mut output).unwrap();
+    connector.step(&frame, None, &mut output).unwrap();
 
     assert!(
         matches!(connector.state, ClientConnectorState::ConnectionFinalization { .. }),
@@ -479,6 +512,10 @@ fn should_perform_multitransport_reflects_pending_state() {
     let connector = multitransport_pending_connector(true, multitransport_request(1, RequestedProtocol::UdpFecR));
     assert!(connector.should_perform_multitransport());
     assert_eq!(connector.multitransport_request().unwrap().request_id, 1);
+    assert_eq!(connector.multitransport_soft_sync_negotiated(), Some(true));
+
+    let connector = multitransport_pending_connector(false, multitransport_request(2, RequestedProtocol::UdpFecR));
+    assert_eq!(connector.multitransport_soft_sync_negotiated(), Some(false));
 }
 
 #[test]
@@ -552,7 +589,9 @@ fn skip_multitransport_declines_with_e_abort_under_soft_sync() {
     // MS-RDPBCGR 3.2.5.15.1 requires a response to every request once Soft-Sync
     // is mutually negotiated, whatever the outcome. Both the async and blocking
     // drivers skip automatically, so a silent skip leaves a compliant server
-    // waiting on a response it is entitled to.
+    // The blocking driver and the async compatibility entry point skip
+    // automatically, so a silent skip leaves a compliant server waiting on a
+    // response it is entitled to.
     let mut connector = multitransport_pending_connector(true, multitransport_request(1, RequestedProtocol::UdpFecR));
     let mut output = WriteBuf::new();
 
@@ -676,4 +715,115 @@ fn demand_active_user_data_does_not_decode_as_multitransport_request() {
         decode::<MultitransportRequestPdu>(&user_data).is_err(),
         "a Demand Active must not be mistaken for a multitransport request"
     );
+}
+
+fn server_redirection() -> ServerRedirectionPdu {
+    ServerRedirectionPdu {
+        session_id: 4,
+        target_fqdn: Some("target.example.com".to_owned()),
+        load_balance_info: Some(b"Cookie: msts=3640205228.15629.0000\r\n".to_vec()),
+        ..ServerRedirectionPdu::default()
+    }
+}
+
+/// A server may redirect the client instead of activating it ([MS-RDPBCGR] 3.2.5.13.1): the connector ends in
+/// `Redirected` rather than failing on an unexpected PDU.
+// oracle: spec MS-RDPBCGR §3.2.5.13.1
+#[test]
+fn server_redirection_during_capabilities_exchange_ends_the_connection_sequence() {
+    let config = test_config();
+    let mut connector = ClientConnector::new(config.clone(), "127.0.0.1:3389".parse().unwrap());
+    connector.state = ClientConnectorState::CapabilitiesExchange {
+        connection_activation: ConnectionActivationSequence::new(config, IO_CHANNEL_ID, USER_CHANNEL_ID),
+    };
+
+    let frame = encode_server_share_control(ShareControlPdu::ServerRedirect(server_redirection()));
+    let written = connector.step(&frame, None, &mut WriteBuf::new()).unwrap();
+
+    assert_eq!(written, Written::Nothing);
+    let Some(ConnectionOutcome::Redirected(redirection)) = connector.state.take_outcome() else {
+        panic!("expected a redirection outcome");
+    };
+    assert_eq!(redirection.session_id, 4);
+    assert_eq!(redirection.target_fqdn.as_deref(), Some("target.example.com"));
+}
+
+/// `LB_NOREDIRECT` marks the PDU as informational only ([MS-RDPBCGR] 2.2.13.1).
+// oracle: spec MS-RDPBCGR §2.2.13.1
+#[test]
+fn informational_server_redirection_does_not_interrupt_activation() {
+    let mut sequence = ConnectionActivationSequence::new(test_config(), IO_CHANNEL_ID, USER_CHANNEL_ID);
+    let informational = ServerRedirectionPdu {
+        flags: ServerRedirectionFlags::NO_REDIRECT,
+        ..server_redirection()
+    };
+
+    let frame = encode_server_share_control(ShareControlPdu::ServerRedirect(informational));
+    sequence.step(&frame, None, &mut WriteBuf::new()).unwrap();
+
+    assert!(matches!(
+        sequence.connection_activation_state(),
+        ConnectionActivationState::CapabilitiesExchange
+    ));
+}
+
+// oracle: spec MS-RDPBCGR §3.2.5.13.1
+#[test]
+fn active_processor_surfaces_server_redirection() {
+    let frame = encode_server_share_control(ShareControlPdu::ServerRedirect(server_redirection()));
+    let mut processor = Processor::new(
+        StaticChannelSet::new(),
+        USER_CHANNEL_ID,
+        IO_CHANNEL_ID,
+        Some(MESSAGE_CHANNEL_ID),
+        SHARE_ID,
+    );
+
+    let outputs = processor.process(&frame, &mut None, None).unwrap();
+
+    assert!(matches!(
+        outputs.as_slice(),
+        [ProcessorOutput::ServerRedirection(redirection)] if redirection.session_id == 4
+    ));
+}
+
+/// An informational Enhanced Security Server Redirection PDU uses Share Control framing, so a PDU concatenated after it
+/// in the same Send Data Indication is still processed.
+// oracle: spec MS-RDPBCGR §2.2.13.3.1
+#[test]
+fn active_processor_processes_the_pdu_after_an_informational_server_redirection() {
+    let mut user_data = encode_vec(&ShareControlHeader {
+        share_control_pdu: ShareControlPdu::ServerRedirect(ServerRedirectionPdu {
+            flags: ServerRedirectionFlags::NO_REDIRECT,
+            ..server_redirection()
+        }),
+        pdu_source: USER_CHANNEL_ID,
+        share_id: SHARE_ID,
+    })
+    .unwrap();
+    user_data.extend(
+        encode_vec(&ShareControlHeader {
+            share_control_pdu: ShareControlPdu::ServerDeactivateAll(ServerDeactivateAll),
+            pdu_source: USER_CHANNEL_ID,
+            share_id: SHARE_ID,
+        })
+        .unwrap(),
+    );
+    let frame = encode_vec(&X224(McsMessage::SendDataIndication(SendDataIndication {
+        initiator_id: USER_CHANNEL_ID,
+        channel_id: IO_CHANNEL_ID,
+        user_data: Cow::Owned(user_data),
+    })))
+    .unwrap();
+    let mut processor = Processor::new(
+        StaticChannelSet::new(),
+        USER_CHANNEL_ID,
+        IO_CHANNEL_ID,
+        Some(MESSAGE_CHANNEL_ID),
+        SHARE_ID,
+    );
+
+    let outputs = processor.process(&frame, &mut None, None).unwrap();
+
+    assert!(matches!(outputs.as_slice(), [ProcessorOutput::DeactivateAll]));
 }

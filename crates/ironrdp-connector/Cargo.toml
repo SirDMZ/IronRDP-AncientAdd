@@ -1,6 +1,6 @@
 [package]
 name = "ironrdp-connector"
-version = "0.10.0"
+version = "0.11.0"
 readme = "README.md"
 description = "State machines to drive an RDP connection sequence"
 edition.workspace = true
@@ -26,17 +26,17 @@ qoiz = ["ironrdp-pdu/qoiz"]
 scard = ["sspi/scard", "dep:picky", "dep:picky-asn1-der", "dep:picky-asn1-x509"]
 
 [dependencies]
-ironrdp-svc = { path = "../ironrdp-svc", version = "0.8" } # public
-ironrdp-core = { path = "../ironrdp-core", version = "0.2" } # public
+ironrdp-svc = { path = "../ironrdp-svc", version = "0.9" } # public
+ironrdp-core = { path = "../ironrdp-core", version = "0.3" } # public
 ironrdp-error = { path = "../ironrdp-error", version = "0.2" } # public
-ironrdp-pdu = { path = "../ironrdp-pdu", version = "0.9", features = ["std"] } # public
-sspi = { version = "0.21", default-features = false }
+ironrdp-pdu = { path = "../ironrdp-pdu", version = "0.10", features = ["std"] } # public
+sspi = { version = "0.23", default-features = false } # public
 url = "2.5" # public
 rand = { version = "0.9", features = ["std"] } # TODO: dependency injection?
 tracing = { version = "0.1", features = ["log"] }
 picky-asn1-der = { version = "0.5", optional = true }
 picky-asn1-x509 = { version = "0.15", optional = true }
-picky = { version = "=7.0.0-rc.25", optional = true } # FIXME: We are pinning with = because the candidate version number counts as the minor number by Cargo, and will be automatically bumped in the Cargo.lock.
+picky = { version = "=7.0.0-rc.26", optional = true } # FIXME: We are pinning with = because the candidate version number counts as the minor number by Cargo, and will be automatically bumped in the Cargo.lock.
 
 [lints]
 workspace = true

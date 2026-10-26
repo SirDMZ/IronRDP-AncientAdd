@@ -10,10 +10,17 @@ FLAGS:
 
 TASKS:
   bootstrap               Install all requirements for development
+  bench corpus-fetch      Fetch and verify the pinned benchmark capture corpus
+  bench corpus-list       List pinned benchmark capture corpus metadata
+  bench rfx-decode [--filter <REGEX>] [--save-baseline <NAME>] [--baseline <NAME>]
+                          Run the native RemoteFX decode benchmark
+  bench rfx-decode-wasm [--simd]
+                          Build the RemoteFX decode benchmark for WASM and run it under Node
   check fmt               Check formatting
   check lints             Check lints
   check locks             Check for dirty or staged lock files not yet committed
   check dependencies      Check dependency-graph invariants between crates
+  check captures          Reject tracked packet capture files
   check test-settings --base <REV> --head <REV>
                           Prevent removal of protected Cargo test settings
   check tests [--no-run]  Compile tests and, unless specified otherwise, run them
@@ -32,6 +39,9 @@ TASKS:
   fuzz corpus-min [--target <NAME>]
                           Minify fuzzing corpus for a specific target (or all if unspecified)
   fuzz corpus-push        Push fuzzing corpus to Azure storage
+  fuzz coverage [--target <NAME>]
+                          Run a target (or all targets) against its existing corpus and
+                          print per-file line coverage
   fuzz install            Install dependencies required for fuzzing
   fuzz list [--format <FMT>]
                           List fuzz targets (fmt: human (default) | github-matrix)
@@ -82,10 +92,13 @@ impl core::str::FromStr for ListFormat {
 pub enum Action {
     ShowHelp,
     Bootstrap,
+    BenchCorpusFetch,
+    BenchCorpusList,
     CheckFmt,
     CheckLints,
     CheckLocks,
     CheckDependencies,
+    CheckCaptures,
     CheckTestSettings {
         base: String,
         head: String,
@@ -110,6 +123,9 @@ pub enum Action {
         target: Option<String>,
     },
     FuzzCorpusPush,
+    FuzzCoverage {
+        target: Option<String>,
+    },
     FuzzInstall,
     FuzzList {
         format: ListFormat,
@@ -117,6 +133,14 @@ pub enum Action {
     FuzzRun {
         duration: Option<u32>,
         target: Option<String>,
+    },
+    BenchRfxDecode {
+        filter: Option<String>,
+        save_baseline: Option<String>,
+        baseline: Option<String>,
+    },
+    BenchRfxDecodeWasm {
+        simd: bool,
     },
     WasmCheck,
     WasmInstall,
@@ -141,11 +165,26 @@ pub fn parse_args() -> anyhow::Result<Args> {
     } else {
         match args.subcommand()?.as_deref() {
             Some("bootstrap") => Action::Bootstrap,
+            Some("bench") => match args.subcommand()?.as_deref() {
+                Some("corpus-fetch") => Action::BenchCorpusFetch,
+                Some("corpus-list") => Action::BenchCorpusList,
+                Some("rfx-decode") => Action::BenchRfxDecode {
+                    filter: args.opt_value_from_str("--filter")?,
+                    save_baseline: args.opt_value_from_str("--save-baseline")?,
+                    baseline: args.opt_value_from_str("--baseline")?,
+                },
+                Some("rfx-decode-wasm") => Action::BenchRfxDecodeWasm {
+                    simd: args.contains("--simd"),
+                },
+                Some(unknown) => anyhow::bail!("unknown bench action: {unknown}"),
+                None => Action::ShowHelp,
+            },
             Some("check") => match args.subcommand()?.as_deref() {
                 Some("fmt") => Action::CheckFmt,
                 Some("lints") => Action::CheckLints,
                 Some("locks") => Action::CheckLocks,
                 Some("dependencies") => Action::CheckDependencies,
+                Some("captures") => Action::CheckCaptures,
                 Some("test-settings") => Action::CheckTestSettings {
                     base: args.value_from_str("--base")?,
                     head: args.value_from_str("--head")?,
@@ -178,6 +217,9 @@ pub fn parse_args() -> anyhow::Result<Args> {
                     target: args.opt_value_from_str("--target")?,
                 },
                 Some("corpus-push") => Action::FuzzCorpusPush,
+                Some("coverage") => Action::FuzzCoverage {
+                    target: args.opt_value_from_str("--target")?,
+                },
                 Some("install") => Action::FuzzInstall,
                 Some("list") => Action::FuzzList {
                     format: args.opt_value_from_str("--format")?.unwrap_or(ListFormat::DEFAULT),

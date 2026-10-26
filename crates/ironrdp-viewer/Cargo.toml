@@ -21,11 +21,11 @@ name = "ironrdp-viewer"
 test = false
 
 [features]
-default = ["rustls", "sound"]
+default = ["rustls", "sound", "udp"]
 rustls = ["ironrdp/rustls", "ironrdp-daemon/rustls"]
-# Pure-Rust rustls (RustCrypto provider). Build a C-toolchain-free viewer with
-# `--no-default-features --features rustls-rustcrypto` (drops audio's bundled libopus
-# and the aws-lc-rs crypto provider — no CMake/NASM required).
+# Pure-Rust rustls (RustCrypto provider). Build a C-toolchain-free viewer, with no CMake or NASM,
+# with `--no-default-features --features rustls-rustcrypto,sound`, which leaves out the aws-lc-rs
+# provider, Opus and RDP-UDP.
 rustls-rustcrypto = ["ironrdp/rustls-rustcrypto", "ironrdp-daemon/rustls-rustcrypto"]
 native-tls = ["ironrdp/native-tls", "ironrdp-daemon/native-tls"]
 # Audio output/input redirection. PCM-only via cpal, so it needs no CMake/C toolchain
@@ -34,22 +34,25 @@ sound = ["ironrdp/client-sound"]
 # Add Opus to audio (bandwidth saving) — pulls a CMake-built libopus, reintroducing the
 # C-toolchain build requirement. Opt-in on top of `sound`.
 sound-opus = ["sound", "ironrdp/client-sound-opus"]
+# RDP-UDP multitransport. Its TLS sideband uses the aws-lc-rs provider, which needs CMake and NASM.
+udp = ["ironrdp/client-udp"]
 qoi = ["ironrdp/qoi"]
 qoiz = ["ironrdp/qoiz"]
+# Decode H.264 graphics and MS-RDPEVOR video with the bundled OpenH264 sources.
+openh264 = ["ironrdp/client-openh264"]
 
 [dependencies]
 # `default-features = false` so the viewer's TLS-backend features drive the daemon's
 # backend (otherwise its default `rustls`/aws-lc-rs would always be pulled in).
 ironrdp-daemon = { path = "../ironrdp-daemon", version = "0.1", default-features = false } # public
 ironrdp-rpc = { path = "../ironrdp-rpc", version = "0.1" }
-# `client-all` minus `client-sound`, which is gated behind this crate's optional
-# `sound` feature above (audio pulls in a CMake-built libopus).
+# `client-all` minus `client-sound` and `client-udp`, which this crate's `sound` and `udp` features gate.
 ironrdp = { path = "../ironrdp", version = "0.17", features = [
     "connector",
     "cliprdr",
     "input",
     "pdu",
-    "graphics",
+    "rdpei",
     "client",
     "client-clipboard",
     "client-rdpdr",
@@ -60,10 +63,15 @@ ironrdp = { path = "../ironrdp", version = "0.17", features = [
     "client-dvc-com-plugin",
     "client-webauthn",
     "client-vmconnect",
-] }
-ironrdp-cfg = { path = "../ironrdp-cfg", version = "0.1" }
+    "client-location",
+    "client-camera",
+    "client-video",
+    "client-usb",
+] } # public
+ironrdp-cfg = { path = "../ironrdp-cfg", version = "0.2" }
 ironrdp-propertyset = { path = "../ironrdp-propertyset", version = "0.1" }
 ironrdp-rdpfile = { path = "../ironrdp-rdpfile", version = "0.1" }
+ironrdp-rail = { path = "../ironrdp-rail", version = "0.2" }
 
 # Windowing and rendering
 winit = { version = "0.30", features = ["rwh_06"] }
@@ -91,7 +99,9 @@ raw-window-handle = "0.6"
 url = "2"
 
 [target.'cfg(windows)'.dependencies]
-ironrdp-rdpdr-native = { path = "../ironrdp-rdpdr-native", version = "0.7" }
+ironrdp-cliprdr-native = { path = "../ironrdp-cliprdr-native", version = "0.8" }
+ironrdp-rdpdr-native = { path = "../ironrdp-rdpdr-native", version = "0.8" }
+windows = { version = "0.62", features = ["Win32_System_Ole", "Win32_UI_WindowsAndMessaging"] }
 
 [lints]
 workspace = true

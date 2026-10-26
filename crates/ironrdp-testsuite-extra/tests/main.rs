@@ -2,9 +2,14 @@
 #![allow(clippy::unwrap_used, reason = "unwrap is fine in tests")]
 
 mod agent;
+mod async_framed;
 mod capture_helpers;
-mod client_config;
+mod client;
+#[cfg(any(target_os = "linux", windows))]
+mod cliprdr_native;
 mod dvc_pipe_proxy;
 mod e2e;
+mod gateway_detect;
+mod rdpeudp_tokio;
 mod vmconnect;
 mod volume;

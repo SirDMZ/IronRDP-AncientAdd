@@ -19,6 +19,8 @@ use crate::{DynamicChannelId, String, Vec};
 pub enum DrdynvcDataPdu {
     DataFirst(DataFirstPdu),
     Data(DataPdu),
+    DataFirstCompressed(DataFirstCompressedPdu),
+    DataCompressed(DataCompressedPdu),
 }
 
 impl DrdynvcDataPdu {
@@ -29,6 +31,21 @@ impl DrdynvcDataPdu {
         match self {
             DrdynvcDataPdu::DataFirst(pdu) => pdu.channel_id,
             DrdynvcDataPdu::Data(pdu) => pdu.channel_id,
+            DrdynvcDataPdu::DataFirstCompressed(pdu) => pdu.0.channel_id,
+            DrdynvcDataPdu::DataCompressed(pdu) => pdu.0.channel_id,
+        }
+    }
+
+    /// Decodes the data PDU that `header` announces. Data PDUs are the same in both directions.
+    fn decode(header: Header, src: &mut ReadCursor<'_>) -> DecodeResult<Self> {
+        match header.cmd {
+            Cmd::DataFirst => Ok(Self::DataFirst(DataFirstPdu::decode(header, src)?)),
+            Cmd::Data => Ok(Self::Data(DataPdu::decode(header, src)?)),
+            Cmd::DataFirstCompressed => Ok(Self::DataFirstCompressed(DataFirstCompressedPdu(DataFirstPdu::decode(
+                header, src,
+            )?))),
+            Cmd::DataCompressed => Ok(Self::DataCompressed(DataCompressedPdu(DataPdu::decode(header, src)?))),
+            _ => Err(unsupported_value_err!("Cmd", header.cmd.into(), in: src)),
         }
     }
 }
@@ -38,6 +55,8 @@ impl Encode for DrdynvcDataPdu {
         match self {
             DrdynvcDataPdu::DataFirst(pdu) => pdu.encode(dst),
             DrdynvcDataPdu::Data(pdu) => pdu.encode(dst),
+            DrdynvcDataPdu::DataFirstCompressed(pdu) => pdu.0.encode(dst),
+            DrdynvcDataPdu::DataCompressed(pdu) => pdu.0.encode(dst),
         }
     }
 
@@ -45,6 +64,8 @@ impl Encode for DrdynvcDataPdu {
         match self {
             DrdynvcDataPdu::DataFirst(_) => DataFirstPdu::name(),
             DrdynvcDataPdu::Data(_) => DataPdu::name(),
+            DrdynvcDataPdu::DataFirstCompressed(_) => DataFirstCompressedPdu::name(),
+            DrdynvcDataPdu::DataCompressed(_) => DataCompressedPdu::name(),
         }
     }
 
@@ -52,6 +73,8 @@ impl Encode for DrdynvcDataPdu {
         match self {
             DrdynvcDataPdu::DataFirst(pdu) => pdu.size(),
             DrdynvcDataPdu::Data(pdu) => pdu.size(),
+            DrdynvcDataPdu::DataFirstCompressed(pdu) => pdu.0.size(),
+            DrdynvcDataPdu::DataCompressed(pdu) => pdu.0.size(),
         }
     }
 }
@@ -104,14 +127,13 @@ impl Decode<'_> for DrdynvcClientPdu {
         let header = Header::decode(src)?;
         match header.cmd {
             Cmd::Create => Ok(Self::Create(CreateResponsePdu::decode(header, src)?)),
-            Cmd::DataFirst => Ok(Self::Data(DrdynvcDataPdu::DataFirst(DataFirstPdu::decode(
-                header, src,
-            )?))),
-            Cmd::Data => Ok(Self::Data(DrdynvcDataPdu::Data(DataPdu::decode(header, src)?))),
+            Cmd::DataFirst | Cmd::Data | Cmd::DataFirstCompressed | Cmd::DataCompressed => {
+                Ok(Self::Data(DrdynvcDataPdu::decode(header, src)?))
+            }
             Cmd::Close => Ok(Self::Close(ClosePdu::decode(header, src)?)),
             Cmd::Capability => Ok(Self::Capabilities(CapabilitiesResponsePdu::decode(header, src)?)),
             Cmd::SoftSyncResponse => Ok(Self::SoftSyncResponse(SoftSyncResponsePdu::decode(header, src)?)),
-            _ => Err(unsupported_value_err!("Cmd", header.cmd.into())),
+            _ => Err(unsupported_value_err!("Cmd", header.cmd.into(), in: src)),
         }
     }
 }
@@ -164,14 +186,13 @@ impl Decode<'_> for DrdynvcServerPdu {
         let header = Header::decode(src)?;
         match header.cmd {
             Cmd::Create => Ok(Self::Create(CreateRequestPdu::decode(header, src)?)),
-            Cmd::DataFirst => Ok(Self::Data(DrdynvcDataPdu::DataFirst(DataFirstPdu::decode(
-                header, src,
-            )?))),
-            Cmd::Data => Ok(Self::Data(DrdynvcDataPdu::Data(DataPdu::decode(header, src)?))),
+            Cmd::DataFirst | Cmd::Data | Cmd::DataFirstCompressed | Cmd::DataCompressed => {
+                Ok(Self::Data(DrdynvcDataPdu::decode(header, src)?))
+            }
             Cmd::Close => Ok(Self::Close(ClosePdu::decode(header, src)?)),
             Cmd::Capability => Ok(Self::Capabilities(CapabilitiesRequestPdu::decode(header, src)?)),
             Cmd::SoftSyncRequest => Ok(Self::SoftSyncRequest(SoftSyncRequestPdu::decode(header, src)?)),
-            _ => Err(unsupported_value_err!("Cmd", header.cmd.into())),
+            _ => Err(unsupported_value_err!("Cmd", header.cmd.into(), in: src)),
         }
     }
 }
@@ -725,7 +746,7 @@ impl DataFirstPdu {
         self.header.cb_id.encode_val(self.channel_id, dst)?;
         self.header
             .sp
-            .encode_val(cast_length!("DataFirstPdu::Length", self.length)?, dst)?;
+            .encode_val(cast_length!("DataFirstPdu::Length", self.length, in: dst)?, dst)?;
         dst.write_slice(&self.data);
         Ok(())
     }
@@ -744,6 +765,76 @@ impl DataFirstPdu {
     }
 }
 
+/// 2.2.3.3 DVC Data First Compressed PDU (DYNVC_DATA_FIRST_COMPRESSED)
+///
+/// Like [`DataFirstPdu`], but the data block is compressed with RDP 8.0 Lite, and the length
+/// counts uncompressed bytes. Only sent once both sides negotiated version 3, over a
+/// reliable transport.
+///
+/// RDP 8.0 Lite is RDP 8.0 bulk compression (MS-RDPEGFX 3.1.9.1) restricted to an
+/// RDP_SEGMENTED_DATA structure holding a single segment of compression type
+/// `PACKET_COMPR_TYPE_RDP8_LITE` (0x06), at most 8,192 uncompressed bytes per segment, and an
+/// 8,192-byte history. The graphics pipeline's RDP 8.0 output does not meet these limits
+/// and is not a valid payload.
+#[derive(Debug, PartialEq)]
+pub struct DataFirstCompressedPdu(DataFirstPdu);
+
+impl DataFirstCompressedPdu {
+    /// `total_length` is the *uncompressed* length of the whole message, and `data` is the
+    /// first block, compressed with RDP 8.0 Lite as described on [`DataFirstCompressedPdu`].
+    pub fn new(channel_id: DynamicChannelId, total_length: u32, data: Vec<u8>) -> Self {
+        Self(DataFirstPdu {
+            header: Header::new(channel_id, total_length, Cmd::DataFirstCompressed),
+            channel_id,
+            length: total_length,
+            data,
+        })
+    }
+
+    /// Returns the uncompressed length of the whole message.
+    pub fn length(&self) -> u32 {
+        self.0.length
+    }
+
+    /// Returns the compressed data block.
+    pub fn data(&self) -> &[u8] {
+        &self.0.data
+    }
+
+    fn name() -> &'static str {
+        "DYNVC_DATA_FIRST_COMPRESSED"
+    }
+}
+
+/// 2.2.3.4 DVC Data Compressed PDU (DYNVC_DATA_COMPRESSED)
+///
+/// Like [`DataPdu`], but the data block is compressed with RDP 8.0 Lite, as described on
+/// [`DataFirstCompressedPdu`]. Only sent once both sides negotiated version 3, over a
+/// reliable transport.
+#[derive(Debug, PartialEq)]
+pub struct DataCompressedPdu(DataPdu);
+
+impl DataCompressedPdu {
+    /// `data` is the data block, compressed with RDP 8.0 Lite as described on
+    /// [`DataFirstCompressedPdu`].
+    pub fn new(channel_id: DynamicChannelId, data: Vec<u8>) -> Self {
+        Self(DataPdu {
+            header: Header::new(channel_id, 0, Cmd::DataCompressed),
+            channel_id,
+            data,
+        })
+    }
+
+    /// Returns the compressed data block.
+    pub fn data(&self) -> &[u8] {
+        &self.0.data
+    }
+
+    fn name() -> &'static str {
+        "DYNVC_DATA_COMPRESSED"
+    }
+}
+
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct FieldType(u8);
 
@@ -755,10 +846,10 @@ impl FieldType {
     fn encode_val(&self, value: u32, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
         ensure_size!(in: dst, size: self.size_of_val());
         match *self {
-            FieldType::U8 => dst.write_u8(cast_length!("FieldType::encode", value)?),
-            FieldType::U16 => dst.write_u16(cast_length!("FieldType::encode", value)?),
+            FieldType::U8 => dst.write_u8(cast_length!("FieldType::encode", value, in: dst)?),
+            FieldType::U16 => dst.write_u16(cast_length!("FieldType::encode", value, in: dst)?),
             FieldType::U32 => dst.write_u32(value),
-            _ => return Err(invalid_field_err!("FieldType", "invalid field type")),
+            _ => return Err(invalid_field_err!("FieldType", "invalid field type", in: dst)),
         };
         Ok(())
     }
@@ -769,7 +860,7 @@ impl FieldType {
             FieldType::U8 => Ok(u32::from(src.read_u8())),
             FieldType::U16 => Ok(u32::from(src.read_u16())),
             FieldType::U32 => Ok(src.read_u32()),
-            _ => Err(invalid_field_err!("FieldType", "invalid field type")),
+            _ => Err(invalid_field_err!("FieldType", "invalid field type", in: src)),
         }
     }
 

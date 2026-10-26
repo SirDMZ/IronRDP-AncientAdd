@@ -40,11 +40,6 @@
     "description": "Improvements or additions to documentation"
   },
   {
-    "name": "duplicate",
-    "color": "cfd3d7",
-    "description": "This issue or pull request already exists"
-  },
-  {
     "name": "size/XS",
     "color": "f9d0c4",
     "description": "Size: up to 49 counted lines and 2 files"
@@ -105,14 +100,29 @@
     "description": "First contribution to this repository"
   },
   {
-    "name": "maintainer-required",
+    "name": "needs-review",
     "color": "c2e0c6",
-    "description": "Maintainer review or intervention is required"
+    "description": "A human reviewer is the current next actor"
+  },
+  {
+    "name": "needs-author-action",
+    "color": "d93f0b",
+    "description": "The pull request author is the current next actor"
+  },
+  {
+    "name": "automation-failed",
+    "color": "b60205",
+    "description": "Exact-head automated classification or review failed or was unavailable"
   },
   {
     "name": "triage/legitimacy",
     "color": "fbca04",
     "description": "A classifier flagged at least one commit for legitimacy triage"
+  },
+  {
+    "name": "triage/overlap",
+    "color": "fbca04",
+    "description": "Possible overlap with another pull request; advisory only"
   },
   {
     "name": "ai-reviewed/1",
@@ -121,6 +131,11 @@
   },
   {
     "name": "ai-reviewed/2",
+    "color": "000000",
+    "description": "Two automated reviews completed"
+  },
+  {
+    "name": "ai-reviewed/3",
     "color": "000000",
     "description": "Final automated review completed"
   }

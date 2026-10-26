@@ -34,6 +34,7 @@ use alloc::{format, string::String, vec, vec::Vec};
 use ironrdp_pdu::{PduResult, pdu_other_err};
 use ironrdp_str::multi_sz::MultiSzString;
 use ironrdp_str::prefixed::Cch32String;
+use ironrdp_usb::BcdVersion;
 
 use crate::pdu::header::{InterfaceId, MessageId};
 use crate::pdu::sink::{
@@ -66,6 +67,13 @@ pub struct DeviceInfo {
     pub active_config: Option<UsbConfigInfo>,
     /// Backend-observed connection speed. RDPEUSB only carries a high-speed boolean.
     pub speed: UsbConnectionSpeed,
+    /// Whether the backend performs isochronous transfers.
+    ///
+    /// `ADD_DEVICE` advertises a nonzero no-ack isochronous write jitter buffer only when this is
+    /// set, so that a server does not route isochronous traffic to a backend that cannot carry it.
+    ///
+    /// Ref: [MS-RDPEUSB USB_DEVICE_CAPABILITIES] NoAckIsochWriteJitterBufferSizeInMs.
+    pub isochronous: bool,
 }
 
 impl DeviceInfo {
@@ -129,7 +137,7 @@ pub struct UsbDeviceDescriptorInfo {
     pub vendor_id: u16,
     pub product_id: u16,
     pub device_version: u16,
-    pub usb_version: UsbBcdVersion,
+    pub usb_version: BcdVersion,
     pub class_codes: UsbClassCodes,
     pub num_configurations: u8,
 }
@@ -160,33 +168,6 @@ impl UsbClassCodes {
         sub_class_code: 0x00,
         protocol_code: 0x00,
     };
-}
-
-/// Raw `bcdUSB` value from the USB device descriptor.
-///
-/// The value is preserved without BCD validation. RDPEUSB supports only
-/// USB 1.0, 1.1, and 2.0, so newer values are advertised as USB 2.0.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct UsbBcdVersion(u16);
-impl UsbBcdVersion {
-    /// Wraps a raw `bcdUSB` value without validating its BCD digits.
-    pub const fn from_bcd(value: u16) -> Self {
-        Self(value)
-    }
-
-    fn to_supported_usb_version(self) -> SupportedUsbVer {
-        if self.0 >= 0x0200 {
-            SupportedUsbVer::USB_20
-        } else if self.0 >= 0x0110 {
-            SupportedUsbVer::USB_11
-        } else {
-            SupportedUsbVer::USB_10
-        }
-    }
-
-    fn is_at_least_usb20(self) -> bool {
-        self.0 >= 0x0200
-    }
 }
 
 /// Connection speed reported by the USB backend.
@@ -293,13 +274,33 @@ fn usb_device_caps(info: &DeviceInfo) -> PduResult<UsbDeviceCaps> {
     Ok(UsbDeviceCaps {
         usb_bus_iface_ver: UsbBusIfaceVer::V2,
         usbdi_ver: UsbdiVer::V0X600,
-        supported_usb_ver: info.descriptor.usb_version.to_supported_usb_version(),
+        supported_usb_ver: supported_usb_version(info.descriptor.usb_version),
         device_speed: device_speed(info)?,
-        no_ack_isoch_write_jitter_buf_size: NoAckIsochWriteJitterBufSizeInMs::try_from(
-            DEFAULT_NO_ACK_ISOCH_WRITE_JITTER_MS,
-        )
+        // Zero means TS_URB_ISOCH_TRANSFER is not supported.
+        no_ack_isoch_write_jitter_buf_size: NoAckIsochWriteJitterBufSizeInMs::try_from(if info.isochronous {
+            DEFAULT_NO_ACK_ISOCH_WRITE_JITTER_MS
+        } else {
+            0
+        })
         .map_err(|_| pdu_other_err!("default isochronous jitter buffer size is invalid"))?,
     })
+}
+
+/// Map `bcdUSB` onto the RDPEUSB capability field.
+///
+/// The PDU enum models only USB 1.0, 1.1, and 2.0, so newer versions are advertised as USB 2.0.
+fn supported_usb_version(usb_version: BcdVersion) -> SupportedUsbVer {
+    if is_at_least_usb20(usb_version) {
+        SupportedUsbVer::USB_20
+    } else if usb_version.raw() >= 0x0110 {
+        SupportedUsbVer::USB_11
+    } else {
+        SupportedUsbVer::USB_10
+    }
+}
+
+fn is_at_least_usb20(usb_version: BcdVersion) -> bool {
+    usb_version.raw() >= 0x0200
 }
 
 fn device_speed(info: &DeviceInfo) -> PduResult<DeviceSpeed> {
@@ -309,7 +310,7 @@ fn device_speed(info: &DeviceInfo) -> PduResult<DeviceSpeed> {
             Ok(DeviceSpeed::HIGH_SPEED)
         }
         UsbConnectionSpeed::Unknown => {
-            if info.descriptor.usb_version.is_at_least_usb20() {
+            if is_at_least_usb20(info.descriptor.usb_version) {
                 Ok(DeviceSpeed::HIGH_SPEED)
             } else {
                 Ok(DeviceSpeed::FULL_SPEED)

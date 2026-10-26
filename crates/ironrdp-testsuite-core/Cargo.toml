@@ -25,9 +25,11 @@ harness = true
 [dependencies]
 array-concat = "0.5"
 expect-test = "1"
+ironrdp-cliprdr.path = "../ironrdp-cliprdr"
 ironrdp-core.path = "../ironrdp-core"
 ironrdp-egfx.path = "../ironrdp-egfx"
 ironrdp-pdu.path = "../ironrdp-pdu"
+ironrdp-svc.path = "../ironrdp-svc"
 paste = "1"
 openh264 = { version = "0.9", optional = true, default-features = false, features = ["source"] }
 visibility = { version = "0.1", optional = true }
@@ -40,6 +42,8 @@ hex = "0.4"
 ironrdp-cliprdr-format.path = "../ironrdp-cliprdr-format"
 ironrdp-cliprdr = { path = "../ironrdp-cliprdr", features = ["__test"] }
 ironrdp-acceptor.path = "../ironrdp-acceptor"
+ironrdp-async.path = "../ironrdp-async"
+ironrdp-tokio.path = "../ironrdp-tokio"
 ironrdp-bulk.path = "../ironrdp-bulk"
 ironrdp-connector.path = "../ironrdp-connector"
 ironrdp-displaycontrol.path = "../ironrdp-displaycontrol"
@@ -55,10 +59,17 @@ ironrdp-input.path = "../ironrdp-input"
 ironrdp-rdcleanpath.path = "../ironrdp-rdcleanpath"
 ironrdp-rdpdr.path = "../ironrdp-rdpdr"
 ironrdp-rdpeai.path = "../ironrdp-rdpeai"
+ironrdp-rdpecam = { path = "../ironrdp-rdpecam" }
+ironrdp-rdpegt.path = "../ironrdp-rdpegt"
+ironrdp-rdpevor.path = "../ironrdp-rdpevor"
+ironrdp-rdpel.path = "../ironrdp-rdpel"
+ironrdp-rdpemt = { path = "../ironrdp-rdpemt", features = ["std"] }
+ironrdp-rdpeudp = { path = "../ironrdp-rdpeudp", features = ["std"] }
 ironrdp-rdpeusb.path = "../ironrdp-rdpeusb"
+ironrdp-usb.path = "../ironrdp-usb"
 ironrdp-rdpsnd = { path = "../ironrdp-rdpsnd", features = ["__test"] }
-ironrdp-server.path = "../ironrdp-server"
-ironrdp-session = { path = "../ironrdp-session", features = ["qoi"] }
+ironrdp-server = { path = "../ironrdp-server", features = ["qoiz", "__test", "egfx"] }
+ironrdp-session = { path = "../ironrdp-session", features = ["qoiz", "__test"] }
 ironrdp-cfg.path = "../ironrdp-cfg"
 ironrdp-propertyset.path = "../ironrdp-propertyset"
 ironrdp-rdpfile.path = "../ironrdp-rdpfile"
@@ -66,7 +77,11 @@ png = "0.18"
 pretty_assertions = "1.4"
 proptest.workspace = true
 rstest.workspace = true
-tokio = { version = "1", features = ["macros", "rt"] }
+tokio = { version = "1", features = ["macros", "rt", "io-util", "sync", "test-util"] }
+tokio-rustls = "0.26"
+
+[target.'cfg(windows)'.dev-dependencies]
+ironrdp-egfx-native.path = "../ironrdp-egfx-native"
 
 [lints]
 workspace = true

@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use ironrdp_core::{Encode, WriteBuf, decode, encode_vec};
 use ironrdp_pdu::rdp::capability_sets::WindowSupportLevel;
+use ironrdp_pdu::rdp::server_redirection::ServerRedirectionPdu;
 use ironrdp_pdu::rdp::session_info::ServerAutoReconnect;
 use ironrdp_pdu::x224::X224;
 use ironrdp_pdu::{PduHint, gcc, mcs, nego, rdp};
@@ -18,7 +19,7 @@ use crate::connection_activation::{
 };
 use crate::license_exchange::{LicenseExchangeSequence, NoopLicenseCache};
 use crate::{
-    Config, ConnectorError, ConnectorErrorExt as _, ConnectorErrorKind, ConnectorResult, DesktopSize,
+    Config, ConnectorError, ConnectorErrorExt as _, ConnectorErrorKind, ConnectorResult, DesktopSize, MonotonicInstant,
     NegotiationFailure, Sequence, State, Written, encode_x224_packet, general_err, reason_err,
 };
 
@@ -26,6 +27,75 @@ use crate::{
 /// permitted to send during bootstrapping, per MS-RDPBCGR 2.2.15.1 (one per
 /// transport protocol: reliable + lossy UDP).
 const MAX_MULTITRANSPORT_REQUESTS: usize = 2;
+
+/// Size of the auto-detect header that precedes a Bandwidth Measure payload.
+///
+/// `headerLength` + `headerTypeId` + `sequenceNumber` + `requestType` +
+/// `payloadLength`, which [MS-RDPBCGR] 2.2.14.1.3 pins by requiring
+/// `headerLength` to be 0x08.
+const AUTO_DETECT_HEADER_LEN: u32 = 8;
+
+/// What one Bandwidth Measure message contributes to the Network Characteristics
+/// Byte Count store, and the canonical source for the connect-time bandwidth
+/// reasoning this file uses in several places (`UNMEASURABLE_INTERVAL_MS`, the
+/// `BandwidthMeasureStop` arm below, [`Sequence::step`]'s doc). Those restate
+/// only their own local decision plus a pointer here, so the reasoning behind
+/// each one stays single-sourced instead of drifting across independent copies.
+///
+/// **What is counted.** [MS-RDPBCGR] 3.2.5.14 gives connect-time detection
+/// exactly two accumulation steps, one on the Bandwidth Measure Payload and one
+/// on the 0x002B Stop, both reading "increment ... by the value specified in
+/// the **payloadLength** field plus the size of the header fields (8 bytes)".
+/// The section's other accumulation rule, the one that counts every byte
+/// received while the window is open, belongs to the 0x0014 and 0x0114 Starts,
+/// the reliable and lossy UDP variants. Connect-time is 0x1014, whose step list
+/// contains no such clause, so on this path the two per-message increments are
+/// the whole of the byte count.
+///
+/// **Which request types are in scope.** Only the 0x002B Stop, encapsulated in
+/// an Auto-Detect Request PDU during the connect-time phase, is handled here.
+/// [MS-RDPBCGR] 2.2.14.1.4 scopes the Auto-Detect-Request-PDU form of 0x0429 to
+/// *after* the RDP Connection Sequence has completed, so it cannot legitimately
+/// arrive here; its other form, and 0x0629, are tunneled over a multitransport
+/// channel this step never sees. The same 2.2.14.1.4 split sets `headerLength`
+/// to 0x08 for 0x002B and 0x06 otherwise, which is what fixes `AUTO_DETECT_HEADER_LEN`
+/// at 8 for this path specifically.
+///
+/// **Windows that could not be timed.** A driver whose `received_at` is always
+/// `None` never opens a window (see [`Sequence::step`]'s doc), so its Results
+/// report only the Stop's own payload against the untimed floor
+/// (`UNMEASURABLE_INTERVAL_MS`) rather than a full count divided by a
+/// `timeDelta` nobody measured. [MS-RDPBCGR] 3.2.5.14 states the Payload
+/// increment unconditionally; gating it on the window being open is a
+/// deliberate SHOULD-level deviation. It under-reports rather than over-reports
+/// (a server acting on 3.3.5.14 picks conservative settings for such a client),
+/// so it is not treated as a spec violation worth rejecting.
+///
+/// **This deliberately does not match FreeRDP.** FreeRDP counts the whole PDU
+/// length at the framing layer, `bandwidthMeasureByteCount += length` in
+/// `libfreerdp/core/rdp.c` after `rdp_read_header`, for any window including
+/// connect-time, and then adds `payloadLength` again in
+/// `libfreerdp/core/autodetect.c` for the Payload and the Stop. On the
+/// connect-time path that counts the payload twice and adds framing bytes the
+/// spec does not ask for. The figure is an informational QoS hint and the server
+/// proceeds either way, so following the spec costs no interop and is easier to
+/// justify than reproducing the reference's arithmetic. (This citation names
+/// files and expressions in a project outside this tree; it may drift as
+/// FreeRDP changes, and is not itself load-bearing for the decision above.)
+fn counted_len(payload_len: usize) -> u32 {
+    u32::try_from(payload_len)
+        .unwrap_or(u32::MAX)
+        .saturating_add(AUTO_DETECT_HEADER_LEN)
+}
+
+/// Reported as `timeDelta` when a connect-time bandwidth window was not timed.
+/// See [`counted_len`]'s doc for why an untimed window is reported at all.
+///
+/// One millisecond rather than zero, because a server computing
+/// `byteCount * 8 / timeDelta` divides by it ([MS-RDPBCGR] 3.3.5.14). It also
+/// floors a window that was timed and elapsed in under a millisecond, where it is
+/// a real bound rather than a stand-in.
+const UNMEASURABLE_INTERVAL_MS: u32 = 1;
 
 /// Outcome of a single multitransport bootstrapping request, passed to
 /// [`ClientConnector::complete_multitransport()`].
@@ -41,6 +111,30 @@ pub enum MultitransportResult {
     /// UDP transport failed. The `u32` is the HRESULT error code (typically
     /// [`MultitransportResponsePdu::E_ABORT`](rdp::multitransport::MultitransportResponsePdu::E_ABORT)).
     Failure(u32),
+}
+
+impl MultitransportResult {
+    const fn response_required(&self, soft_sync: bool) -> bool {
+        soft_sync || matches!(self, Self::Failure(_))
+    }
+
+    /// Builds the required response PDU for this outcome and request.
+    ///
+    /// Successful initiation without Soft-Sync does not require a response.
+    pub fn response_pdu(
+        &self,
+        request_id: u32,
+        soft_sync: bool,
+    ) -> Option<rdp::multitransport::MultitransportResponsePdu> {
+        if !self.response_required(soft_sync) {
+            return None;
+        }
+
+        Some(match self {
+            Self::Success => rdp::multitransport::MultitransportResponsePdu::success(request_id),
+            Self::Failure(hr) => multitransport_response(request_id, *hr),
+        })
+    }
 }
 
 /// Why a runtime-defined static virtual channel could not be registered.
@@ -82,6 +176,8 @@ pub struct ConnectionResult {
     /// `None` means Window List was absent or disabled, so windowing orders
     /// retain ordinary desktop-session handling.
     pub window_support_level: Option<WindowSupportLevel>,
+    /// The monitor layout reported by the server during connection finalization.
+    pub monitor_layout: Option<rdp::finalization_messages::MonitorLayoutPdu>,
     /// Factory for producing connection activation sequences.
     ///
     /// Used to drive the [Deactivation-Reactivation Sequence] when a Server Deactivate All PDU is
@@ -91,6 +187,45 @@ pub struct ConnectionResult {
     pub activation_factory: ConnectionActivationFactory,
     /// The bulk compression type that was negotiated, if any.
     pub compression_type: Option<rdp::client_info::CompressionType>,
+}
+
+impl ConnectionResult {
+    /// Whether both peers advertised Soft-Sync support for multitransport.
+    pub fn multitransport_soft_sync(&self) -> bool {
+        self.activation_factory.multitransport_soft_sync()
+    }
+}
+
+/// How a client connection sequence ended.
+#[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the outcome is produced once per connection and moved straight to its consumer"
+)]
+pub enum ConnectionOutcome {
+    /// The connection is established and the session can start.
+    Connected(ConnectionResult),
+    /// The server sent a Server Redirection PDU ([MS-RDPBCGR] 3.2.5.13.1).
+    ///
+    /// The client must close this connection and connect to the target the PDU describes, sending its
+    /// load-balancing information as the routing token and its session ID in the Client Cluster Data.
+    ///
+    /// [MS-RDPBCGR]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/
+    Redirected(Box<ServerRedirectionPdu>),
+}
+
+impl ConnectionOutcome {
+    /// Returns the connection result, or an error for a client that does not follow redirections.
+    pub fn into_connected(self) -> ConnectorResult<ConnectionResult> {
+        match self {
+            Self::Connected(result) => Ok(result),
+            Self::Redirected(redirection) => Err(reason_err!(
+                "Connect",
+                "server requested a redirection to session {}, which this client does not follow",
+                redirection.session_id
+            )),
+        }
+    }
 }
 
 #[derive(Default, Debug)]
@@ -196,6 +331,26 @@ pub enum ClientConnectorState {
     Connected {
         result: ConnectionResult,
     },
+    /// The server sent a Server Redirection PDU instead of completing the connection.
+    ///
+    /// See [`ConnectionOutcome::Redirected`].
+    Redirected {
+        redirection: Box<ServerRedirectionPdu>,
+    },
+}
+
+impl ClientConnectorState {
+    /// Takes the outcome out of a terminal state, leaving [`Self::Consumed`].
+    pub fn take_outcome(&mut self) -> Option<ConnectionOutcome> {
+        match mem::take(self) {
+            Self::Connected { result } => Some(ConnectionOutcome::Connected(result)),
+            Self::Redirected { redirection } => Some(ConnectionOutcome::Redirected(redirection)),
+            other => {
+                *self = other;
+                None
+            }
+        }
+    }
 }
 
 impl State for ClientConnectorState {
@@ -221,11 +376,12 @@ impl State for ClientConnectorState {
                 connection_activation, ..
             } => connection_activation.state().name(),
             Self::Connected { .. } => "Connected",
+            Self::Redirected { .. } => "Redirected",
         }
     }
 
     fn is_terminal(&self) -> bool {
-        matches!(self, Self::Connected { .. })
+        matches!(self, Self::Connected { .. } | Self::Redirected { .. })
     }
 
     fn as_any(&self) -> &dyn core::any::Any {
@@ -233,6 +389,10 @@ impl State for ClientConnectorState {
     }
 }
 
+#[expect(
+    clippy::partial_pub_fields,
+    reason = "server response flags are negotiated internally and must not expand the public connector construction API; the connect-time bandwidth accumulators are likewise internal to the measurement, and exposing them would let a caller break the Start/Payload/Stop invariant"
+)]
 #[derive(Debug)]
 pub struct ClientConnector {
     pub config: Config,
@@ -242,6 +402,10 @@ pub struct ClientConnector {
     pub static_channels: StaticChannelSet,
     /// MCS message channel ID assigned by the server, once negotiated.
     pub message_channel_id: Option<u16>,
+    cluster_data: Option<gcc::ClientClusterData>,
+    load_balance_info: Option<String>,
+    /// X.224 negotiation flags supplied by the server.
+    response_flags: nego::ResponseFlags,
     /// Multitransport flags the server advertised in its GCC
     /// `MultiTransportChannelData` block, if it sent one. Retained because
     /// MS-RDPBCGR 2.2.15.2 permits an `S_OK` response only to a server that
@@ -252,12 +416,20 @@ pub struct ClientConnector {
     ///
     /// Set via [`ClientConnector::with_auto_reconnect_cookie`].
     pub auto_reconnect_cookie: Option<ServerAutoReconnect>,
-    /// Connect-time network auto-detect ([MS-RDPBCGR] 2.2.14) bandwidth-measurement
-    /// scratch state: the instant the current Bandwidth Measure Start was received
-    /// and the bytes tallied since, used to compute the timeDelta/byteCount reported
-    /// in the Bandwidth Measure Results. `None`/`0` when no measurement is in flight.
-    pub bw_measure_start: Option<std::time::Instant>,
-    pub bw_measure_bytes: u32,
+    /// Password cookie from a Server Redirection PDU, sent in the Client Info PDU.
+    redirection_password_cookie: Option<Vec<u8>>,
+    /// Start of the in-flight connect-time bandwidth measurement window.
+    ///
+    /// Set when the server's Bandwidth Measure Start arrives, and only when the
+    /// driver reported an arrival time for it. Cleared when the matching Stop is
+    /// answered. `None` therefore means no window is open, whether because no Start
+    /// was seen or because this driver does not observe time at all.
+    connect_time_bw_started_at: Option<MonotonicInstant>,
+    /// Bytes seen in the open window, accumulated across Payload messages.
+    ///
+    /// Only accumulated while a window is open, since a total with no interval to
+    /// divide it by is not a measurement of anything.
+    connect_time_bw_bytes: u32,
 }
 
 impl ClientConnector {
@@ -268,10 +440,14 @@ impl ClientConnector {
             client_addr,
             static_channels: StaticChannelSet::new(),
             message_channel_id: None,
+            cluster_data: None,
+            load_balance_info: None,
+            response_flags: nego::ResponseFlags::empty(),
             server_multitransport_flags: None,
             auto_reconnect_cookie: None,
-            bw_measure_start: None,
-            bw_measure_bytes: 0,
+            redirection_password_cookie: None,
+            connect_time_bw_started_at: None,
+            connect_time_bw_bytes: 0,
         }
     }
 
@@ -291,6 +467,34 @@ impl ClientConnector {
     #[must_use]
     pub fn with_auto_reconnect_cookie(mut self, cookie: ServerAutoReconnect) -> Self {
         self.auto_reconnect_cookie = Some(cookie);
+        self
+    }
+
+    /// Add GCC Client Cluster Data to advertise or request server-session redirection.
+    #[must_use]
+    pub fn with_cluster_data(mut self, cluster_data: gcc::ClientClusterData) -> Self {
+        self.cluster_data = Some(cluster_data);
+        self
+    }
+
+    /// Send the password cookie of a Server Redirection PDU in the Client Info PDU.
+    ///
+    /// [MS-RDPBCGR] 2.2.13.1 asks the client to pass the `Password` field of the Server Redirection Packet to the
+    /// target server.
+    /// The cookie replaces the configured password in the Client Info PDU only; the credentials still authenticate
+    /// CredSSP.
+    ///
+    /// [MS-RDPBCGR]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/
+    #[must_use]
+    pub fn with_redirection_password_cookie(mut self, cookie: Vec<u8>) -> Self {
+        self.redirection_password_cookie = Some(cookie);
+        self
+    }
+
+    /// Set opaque load-balancing data for the initial X.224 Connection Request.
+    #[must_use]
+    pub fn with_load_balance_info(mut self, load_balance_info: String) -> Self {
+        self.load_balance_info = Some(load_balance_info);
         self
     }
 
@@ -350,12 +554,16 @@ impl ClientConnector {
         output: &mut WriteBuf,
     ) -> ConnectorResult<Written> {
         let connection_request = nego::ConnectionRequest {
-            nego_data: self.config.request_data.clone().or_else(|| {
-                self.config
-                    .credentials
-                    .username()
-                    .map(|username| nego::NegoRequestData::cookie(username.to_owned()))
-            }),
+            nego_data: if self.load_balance_info.is_none() {
+                self.config.request_data.clone().or_else(|| {
+                    self.config
+                        .credentials
+                        .username()
+                        .map(|username| nego::NegoRequestData::cookie(username.to_owned()))
+                })
+            } else {
+                None
+            },
             flags: nego::RequestFlags::empty(),
             protocol: security_protocol,
             correlation_info: None,
@@ -363,7 +571,16 @@ impl ClientConnector {
 
         debug!(message = ?connection_request, "Send");
 
-        let written = ironrdp_core::encode_buf(&X224(connection_request), output).map_err(ConnectorError::encode)?;
+        let written = if let Some(load_balance_info) = &self.load_balance_info {
+            let request = nego::ConnectionRequestWithOpaqueRoutingToken {
+                request: connection_request,
+                routing_token: nego::OpaqueRoutingToken(load_balance_info.clone()),
+            };
+            ironrdp_core::encode_buf(&X224(request), output)
+        } else {
+            ironrdp_core::encode_buf(&X224(connection_request), output)
+        }
+        .map_err(ConnectorError::encode)?;
         self.state = ClientConnectorState::ConnectionInitiationWaitConfirm {
             requested_protocol: security_protocol,
         };
@@ -475,7 +692,8 @@ impl ClientConnector {
     /// Panics if state is not [ClientConnectorState::EnhancedSecurityUpgrade].
     pub fn mark_security_upgrade_as_done(&mut self) {
         assert!(self.should_perform_security_upgrade());
-        self.step(&[], &mut WriteBuf::new()).expect("transition to next state");
+        self.step(&[], None, &mut WriteBuf::new())
+            .expect("transition to next state");
         debug_assert!(!self.should_perform_security_upgrade());
     }
 
@@ -490,7 +708,9 @@ impl ClientConnector {
     /// Panics if state is not [ClientConnectorState::Credssp].
     pub fn mark_credssp_as_done(&mut self) {
         assert!(self.should_perform_credssp());
-        let res = self.step(&[], &mut WriteBuf::new()).expect("transition to next state");
+        let res = self
+            .step(&[], None, &mut WriteBuf::new())
+            .expect("transition to next state");
         debug_assert!(!self.should_perform_credssp());
         assert_eq!(res, Written::Nothing);
     }
@@ -524,6 +744,16 @@ impl ClientConnector {
     pub fn multitransport_request(&self) -> Option<&rdp::multitransport::MultitransportRequestPdu> {
         match &self.state {
             ClientConnectorState::MultitransportPending { request, .. } => Some(request),
+            _ => None,
+        }
+    }
+
+    /// Returns whether both peers advertised Soft-Sync for the pending request.
+    ///
+    /// `None` means no multitransport request is pending.
+    pub fn multitransport_soft_sync_negotiated(&self) -> Option<bool> {
+        match &self.state {
+            ClientConnectorState::MultitransportPending { soft_sync, .. } => Some(*soft_sync),
             _ => None,
         }
     }
@@ -592,27 +822,26 @@ impl ClientConnector {
             return Ok(None);
         };
 
-        match (*soft_sync, result) {
+        if !result.response_required(*soft_sync) {
+            return Ok(None);
+        }
+
+        match *soft_sync {
             // Soft-Sync obliges a response either way, and presupposes the
             // message channel. Falling back to the I/O channel would put the
             // response somewhere the server is not reading, so its absence is an
             // error rather than a reason to improvise.
-            (true, _) => message_channel_id
+            true => message_channel_id
                 .ok_or_else(|| {
                     general_err!("Soft-Sync was negotiated but the server never offered an MCS message channel")
                 })
                 .map(Some),
-            // `S_OK` is the one value 2.2.15.2 forbids here, so success and only
-            // success is withheld. The outcome is still consumed and the
-            // handshake proceeds, so a caller that established the transport does
-            // not have to know which mode is in play.
-            (false, MultitransportResult::Success) => Ok(None),
             // A failure is still reported: 3.2.5.15.1 asks for it whenever the
             // client could not initiate the channel, with no Soft-Sync condition.
             // It is a SHOULD, so a missing message channel means staying silent
             // rather than failing a connection over an optional report. In
             // practice one exists, since 2.2.15.1 puts the request on it.
-            (false, MultitransportResult::Failure(_)) => Ok(*message_channel_id),
+            false => Ok(*message_channel_id),
         }
     }
 
@@ -638,7 +867,7 @@ impl ClientConnector {
             message_channel_id,
             request,
             requests_seen,
-            ..
+            soft_sync,
         } = &self.state
         else {
             return Err(reason_err!(
@@ -646,8 +875,13 @@ impl ClientConnector {
                 "{caller} called outside MultitransportPending state",
             ));
         };
-        let (io_channel_id, user_channel_id, message_channel_id, requests_seen) =
-            (*io_channel_id, *user_channel_id, *message_channel_id, *requests_seen);
+        let (io_channel_id, user_channel_id, message_channel_id, requests_seen, soft_sync) = (
+            *io_channel_id,
+            *user_channel_id,
+            *message_channel_id,
+            *requests_seen,
+            *soft_sync,
+        );
         let request_id = request.request_id;
 
         let response_channel = self.multitransport_response_channel(&result)?;
@@ -657,10 +891,9 @@ impl ClientConnector {
         // Soft-Sync. Either way the outcome is consumed and the handshake
         // proceeds.
         let total_written = if let Some(response_channel) = response_channel {
-            let response = match result {
-                MultitransportResult::Success => rdp::multitransport::MultitransportResponsePdu::success(request_id),
-                MultitransportResult::Failure(hr) => multitransport_response(request_id, hr),
-            };
+            let response = result
+                .response_pdu(request_id, soft_sync)
+                .ok_or_else(|| general_err!("multitransport response channel selected without a required response"))?;
 
             encode_send_data_request(user_channel_id, response_channel, &response, output)?
         } else {
@@ -682,6 +915,149 @@ impl ClientConnector {
             Ok(Written::Nothing)
         } else {
             Written::from_size(total_written)
+        }
+    }
+
+    fn respond_to_connect_time_autodetect(
+        &mut self,
+        request: rdp::autodetect::AutoDetectRequest,
+        received_at: Option<MonotonicInstant>,
+        message_channel_id: u16,
+        user_channel_id: u16,
+        output: &mut WriteBuf,
+    ) -> ConnectorResult<Written> {
+        use ironrdp_pdu::rdp::autodetect::{
+            AutoDetectRequest, AutoDetectResponse, AutoDetectRspPdu, BW_RESULTS_CONNECT_TIME, BW_START_CONNECT_TIME,
+            BW_STOP_CONNECT_TIME,
+        };
+
+        match request {
+            AutoDetectRequest::RttRequest { sequence_number, .. } => {
+                let response = AutoDetectRspPdu::new(AutoDetectResponse::RttResponse { sequence_number });
+                let written = encode_send_data_request(user_channel_id, message_channel_id, &response, output)?;
+                Written::from_size(written)
+            }
+            // Start opens the measurement window ([MS-RDPBCGR] 2.2.14.1.2). No reply is
+            // due; we only note when it arrived.
+            //
+            // Only the connect-time variant belongs to this phase. [MS-RDPBCGR]
+            // 3.2.5.14 gives 0x0014 and 0x0114, the reliable and lossy UDP Starts, a
+            // different procedure: they accumulate every byte received rather than
+            // just the Bandwidth Measure messages, and they are answered on a
+            // multitransport channel. Opening a connect-time window for one would
+            // measure the wrong thing and answer on the wrong channel, so they are
+            // left alone here.
+            //
+            // A driver that reports no arrival time cannot time this window, so it does
+            // not open one. That keeps the two unmeasurable situations distinct: a
+            // window that was timed and turned out to be short is still a measurement,
+            // while a driver with no clock never took one.
+            AutoDetectRequest::BandwidthMeasureStart { request_type, .. } if request_type == BW_START_CONNECT_TIME => {
+                self.connect_time_bw_started_at = received_at;
+                self.connect_time_bw_bytes = 0;
+                Ok(Written::Nothing)
+            }
+            // Payload carries the bytes whose transfer is being timed ([MS-RDPBCGR]
+            // 2.2.14.1.3). No reply is due; accumulate so Stop can report the total.
+            // With no window open there is nothing for the total to be divided by, so
+            // there is nothing worth accumulating.
+            //
+            // [MS-RDPBCGR] 3.2.5.14 increments the Byte Count store by payloadLength
+            // plus the size of the header fields (8 bytes: headerLength, headerTypeId,
+            // sequenceNumber, requestType, and payloadLength itself), not by
+            // payloadLength alone. `payload.len()` is exactly payloadLength, since
+            // decode reads that many bytes into it after consuming the header fields.
+            AutoDetectRequest::BandwidthMeasurePayload { payload, .. } => {
+                if self.connect_time_bw_started_at.is_some() {
+                    let len = counted_len(payload.len());
+                    self.connect_time_bw_bytes = self.connect_time_bw_bytes.saturating_add(len);
+                }
+                Ok(Written::Nothing)
+            }
+            // A connect-time Bandwidth Measure Stop ([MS-RDPBCGR] 2.2.14.1.4) warrants a
+            // Bandwidth Measure Results reply ([MS-RDPBCGR] 2.2.14.2.2), and only the
+            // 0x002B form is handled here; see `counted_len`'s doc for why, and for the
+            // byte-count and untimed-window reasoning this arm applies below.
+            //
+            // The reply is mandatory, not best-effort: FreeRDP-based servers (for
+            // example GNOME Remote Desktop) block in their AWAIT_BW_RESULT state until
+            // they receive it and never proceed to licensing without it, so omitting it
+            // stalls the whole connection.
+            AutoDetectRequest::BandwidthMeasureStop {
+                sequence_number,
+                request_type,
+                payload,
+            } if request_type == BW_STOP_CONNECT_TIME => {
+                let stop_bytes = payload.as_ref().map_or(0, |p| counted_len(p.len()));
+
+                // A window normally opens and closes on the same driver, so the same
+                // driver stamps both Start and this Stop. Nothing enforces that: a
+                // `Framed` rebuilt between the two (leftover bytes handed to a fresh
+                // `Framed`, which starts with no arrival time of its own) would open a
+                // window on one driver and close it on another with no reading, landing
+                // in the `(Some, None)` arm below. That arm silently drops whatever this
+                // window had accumulated; the debug log makes the drop visible instead of
+                // leaving it indistinguishable from the ordinary no-window case.
+                let (time_delta_ms, byte_count) = match (self.connect_time_bw_started_at, received_at) {
+                    (Some(started_at), Some(stopped_at)) => {
+                        let measured_ms =
+                            u32::try_from(stopped_at.duration_since(started_at).as_millis()).unwrap_or(u32::MAX);
+                        (
+                            measured_ms.max(UNMEASURABLE_INTERVAL_MS),
+                            self.connect_time_bw_bytes.saturating_add(stop_bytes),
+                        )
+                    }
+                    (Some(_), None) => {
+                        debug!(
+                            dropped_bytes = self.connect_time_bw_bytes,
+                            "Bandwidth Measure Stop arrived with no arrival time although its window was open; \
+                             dropping the accumulated count"
+                        );
+                        (UNMEASURABLE_INTERVAL_MS, stop_bytes)
+                    }
+                    (None, _) => (UNMEASURABLE_INTERVAL_MS, stop_bytes),
+                };
+
+                self.connect_time_bw_started_at = None;
+                self.connect_time_bw_bytes = 0;
+
+                let response = AutoDetectRspPdu::new(AutoDetectResponse::BandwidthMeasureResults {
+                    sequence_number,
+                    response_type: BW_RESULTS_CONNECT_TIME,
+                    time_delta_ms,
+                    byte_count,
+                });
+                let written = encode_send_data_request(user_channel_id, message_channel_id, &response, output)?;
+                Written::from_size(written)
+            }
+            // A Stop reaching here with any other requestType means a nonconformant
+            // server. [MS-RDPBCGR] 2.2.14.1.4 scopes 0x0429-via-Auto-Detect-Request-PDU
+            // to after the RDP Connection Sequence has completed, so during connect-time
+            // detection the only legitimate form on this channel is 0x002B, matched
+            // above; 0x0429 as a tunneled Sub-Header and 0x0629 both belong to a
+            // multitransport channel this step never sees. No reply is owed here per
+            // spec, but silently dropping it leaves nothing to debug a stalled
+            // connection with, so it is noted rather than swallowed like the truly
+            // expected continuous variants below.
+            AutoDetectRequest::BandwidthMeasureStop {
+                sequence_number,
+                request_type,
+                ..
+            } => {
+                warn!(
+                    sequence_number,
+                    request_type, "Unexpected Bandwidth Measure Stop requestType during connect-time auto-detection"
+                );
+                Ok(Written::Nothing)
+            }
+            // The Network Characteristics Result is informational; nothing to send.
+            //
+            // This also catches the continuous-detection Bandwidth Measure Start,
+            // answered on a multitransport channel under a different procedure.
+            // Reaching it here means a server sent a continuous request during
+            // connect-time detection, which [MS-RDPBCGR] 3.2.5.14 does not provide for;
+            // ignoring is the conservative response.
+            _ => Ok(Written::Nothing),
         }
     }
 }
@@ -707,9 +1083,10 @@ fn advance_licensing_exchange(
     user_channel_id: u16,
     message_channel_id: Option<u16>,
     input: &[u8],
+    received_at: Option<MonotonicInstant>,
     output: &mut WriteBuf,
 ) -> ConnectorResult<(Written, ClientConnectorState)> {
-    let written = license_exchange.step(input, output)?;
+    let written = license_exchange.step(input, received_at, output)?;
 
     let next_state = if license_exchange.state.is_terminal() {
         ClientConnectorState::MultitransportBootstrapping {
@@ -764,7 +1141,7 @@ impl Sequence for ClientConnector {
             ClientConnectorState::ConnectionFinalization {
                 connection_activation, ..
             } => connection_activation.next_pdu_hint(),
-            ClientConnectorState::Connected { .. } => None,
+            ClientConnectorState::Connected { .. } | ClientConnectorState::Redirected { .. } => None,
         }
     }
 
@@ -772,7 +1149,12 @@ impl Sequence for ClientConnector {
         &self.state
     }
 
-    fn step(&mut self, input: &[u8], output: &mut WriteBuf) -> ConnectorResult<Written> {
+    fn step(
+        &mut self,
+        input: &[u8],
+        received_at: Option<MonotonicInstant>,
+        output: &mut WriteBuf,
+    ) -> ConnectorResult<Written> {
         let (written, next_state) = match mem::take(&mut self.state) {
             // Invalid state
             ClientConnectorState::Consumed => {
@@ -821,6 +1203,8 @@ impl Sequence for ClientConnector {
                     ));
                 }
 
+                self.response_flags = flags;
+
                 (
                     Written::Nothing,
                     ClientConnectorState::EnhancedSecurityUpgrade { selected_protocol },
@@ -859,8 +1243,14 @@ impl Sequence for ClientConnector {
             ClientConnectorState::BasicSettingsExchangeSendInitial { selected_protocol } => {
                 debug!("Basic Settings Exchange");
 
-                let client_gcc_blocks =
-                    create_gcc_blocks(&self.config, selected_protocol, self.static_channels.values())?;
+                let client_gcc_blocks = create_gcc_blocks(
+                    &self.config,
+                    self.cluster_data.as_ref(),
+                    selected_protocol,
+                    self.response_flags
+                        .contains(nego::ResponseFlags::EXTENDED_CLIENT_DATA_SUPPORTED),
+                    self.static_channels.values(),
+                )?;
 
                 let connect_initial =
                     mcs::ConnectInitial::with_gcc_blocks(client_gcc_blocks).map_err(ConnectorError::decode)?;
@@ -946,7 +1336,7 @@ impl Sequence for ClientConnector {
                 mut channel_connection,
             } => {
                 debug!("Channel Connection");
-                let written = channel_connection.step(input, output)?;
+                let written = channel_connection.step(input, received_at, output)?;
 
                 let next_state = if let ChannelConnectionState::AllJoined { user_channel_id } = channel_connection.state
                 {
@@ -981,8 +1371,12 @@ impl Sequence for ClientConnector {
             } => {
                 debug!("Secure Settings Exchange");
 
-                let client_info =
-                    create_client_info_pdu(&self.config, &self.client_addr, self.auto_reconnect_cookie.as_ref());
+                let client_info = create_client_info_pdu(
+                    &self.config,
+                    &self.client_addr,
+                    self.auto_reconnect_cookie.as_ref(),
+                    self.redirection_password_cookie.as_deref(),
+                );
 
                 debug!(message = ?client_info, "Send");
 
@@ -1027,12 +1421,11 @@ impl Sequence for ClientConnector {
 
                 if let Some((message_channel_id, data)) = message_channel_pdu {
                     if let Ok(autodetect) = decode::<rdp::autodetect::AutoDetectReqPdu>(&data.user_data) {
-                        let written = respond_to_connect_time_autodetect(
+                        let written = self.respond_to_connect_time_autodetect(
                             autodetect.request,
+                            received_at,
                             message_channel_id,
                             user_channel_id,
-                            &mut self.bw_measure_start,
-                            &mut self.bw_measure_bytes,
                             output,
                         )?;
                         (
@@ -1079,6 +1472,7 @@ impl Sequence for ClientConnector {
                             user_channel_id,
                             self.message_channel_id,
                             input,
+                            received_at,
                             output,
                         )?
                     } else {
@@ -1110,6 +1504,7 @@ impl Sequence for ClientConnector {
                     user_channel_id,
                     self.message_channel_id,
                     input,
+                    received_at,
                     output,
                 )?
             }
@@ -1178,13 +1573,16 @@ impl Sequence for ClientConnector {
                     // exchange with the PDU intact.
                     let mut connection_activation =
                         ConnectionActivationSequence::new(self.config.clone(), io_channel_id, user_channel_id);
-                    let written = connection_activation.step(input, output)?;
+                    let written = connection_activation.step(input, received_at, output)?;
 
                     (
                         written,
                         match connection_activation.connection_activation_state() {
                             ConnectionActivationState::ConnectionFinalization { .. } => {
                                 ClientConnectorState::ConnectionFinalization { connection_activation }
+                            }
+                            ConnectionActivationState::Redirected { redirection } => {
+                                ClientConnectorState::Redirected { redirection }
                             }
                             _ => ClientConnectorState::CapabilitiesExchange { connection_activation },
                         },
@@ -1215,7 +1613,7 @@ impl Sequence for ClientConnector {
             ClientConnectorState::CapabilitiesExchange {
                 mut connection_activation,
             } => {
-                let written = connection_activation.step(input, output)?;
+                let written = connection_activation.step(input, received_at, output)?;
                 match connection_activation.connection_activation_state() {
                     ConnectionActivationState::ConnectionFinalization { .. } => (
                         written,
@@ -1229,6 +1627,9 @@ impl Sequence for ClientConnector {
                         written,
                         ClientConnectorState::CapabilitiesExchange { connection_activation },
                     ),
+                    ConnectionActivationState::Redirected { redirection } => {
+                        (written, ClientConnectorState::Redirected { redirection })
+                    }
                     _ => return Err(general_err!("invalid state (this is a bug)")),
                 }
             }
@@ -1239,12 +1640,15 @@ impl Sequence for ClientConnector {
             ClientConnectorState::ConnectionFinalization {
                 mut connection_activation,
             } => {
-                let written = connection_activation.step(input, output)?;
+                let written = connection_activation.step(input, received_at, output)?;
 
                 let next_state = if !connection_activation.connection_activation_state().is_terminal() {
                     ClientConnectorState::ConnectionFinalization { connection_activation }
                 } else {
                     match connection_activation.connection_activation_state() {
+                        ConnectionActivationState::Redirected { redirection } => {
+                            ClientConnectorState::Redirected { redirection }
+                        }
                         ConnectionActivationState::Finalized {
                             desktop_size,
                             share_id,
@@ -1275,11 +1679,13 @@ impl Sequence for ClientConnector {
                                     refresh_rect_support,
                                     suppress_output_support,
                                     window_support_level,
+                                    monitor_layout: connection_activation.monitor_layout(),
                                     activation_factory: ConnectionActivationFactory::new(
                                         self.config.clone(),
                                         connection_activation.io_channel_id(),
                                         connection_activation.user_channel_id(),
-                                    ),
+                                    )
+                                    .with_multitransport_soft_sync(self.soft_sync_negotiated()),
                                     compression_type: self.config.compression_type,
                                 },
                             }
@@ -1294,6 +1700,7 @@ impl Sequence for ClientConnector {
             //== Connected ==//
             // The client connector job is done.
             ClientConnectorState::Connected { .. } => return Err(general_err!("already connected")),
+            ClientConnectorState::Redirected { .. } => return Err(general_err!("already redirected")),
         };
 
         self.state = next_state;
@@ -1321,79 +1728,12 @@ pub fn encode_send_data_request<T: Encode>(
     Ok(written)
 }
 
-fn respond_to_connect_time_autodetect(
-    request: rdp::autodetect::AutoDetectRequest,
-    message_channel_id: u16,
-    user_channel_id: u16,
-    bw_measure_start: &mut Option<std::time::Instant>,
-    bw_measure_bytes: &mut u32,
-    output: &mut WriteBuf,
-) -> ConnectorResult<Written> {
-    use ironrdp_pdu::rdp::autodetect::{
-        AutoDetectRequest, AutoDetectResponse, AutoDetectRspPdu, BW_RESULTS_CONNECT_TIME,
-    };
-
-    match request {
-        AutoDetectRequest::RttRequest { sequence_number, .. } => {
-            let response = AutoDetectRspPdu::new(AutoDetectResponse::RttResponse { sequence_number });
-            let written = encode_send_data_request(user_channel_id, message_channel_id, &response, output)?;
-            Written::from_size(written)
-        }
-        // Connect-time bandwidth measurement ([MS-RDPBCGR] 2.2.14.1.2-4). The server
-        // brackets a burst of random BW_PAYLOAD data between a Bandwidth Measure Start
-        // and Stop; time the interval and tally the bytes, then reply to the Stop with
-        // a Bandwidth Measure Results PDU ([MS-RDPBCGR] 2.2.14.2.2) so the server learns
-        // the link throughput. Mirrors FreeRDP's autodetect_recv_bandwidth_measure_*.
-        //
-        // The reply is not optional: FreeRDP-based servers (for example GNOME Remote
-        // Desktop) block in AWAIT_BW_RESULT until they receive it and never proceed to
-        // licensing without it, so omitting it stalls the whole connection.
-        AutoDetectRequest::BandwidthMeasureStart { .. } => {
-            *bw_measure_start = Some(std::time::Instant::now());
-            *bw_measure_bytes = 0;
-            debug!("Connect-time bandwidth measure started");
-            Ok(Written::Nothing)
-        }
-        AutoDetectRequest::BandwidthMeasurePayload { payload, .. } => {
-            *bw_measure_bytes = bw_measure_bytes.saturating_add(u32::try_from(payload.len()).unwrap_or(u32::MAX));
-            Ok(Written::Nothing)
-        }
-        AutoDetectRequest::BandwidthMeasureStop {
-            sequence_number,
-            payload,
-            ..
-        } => {
-            if let Some(bytes) = payload {
-                *bw_measure_bytes = bw_measure_bytes.saturating_add(u32::try_from(bytes.len()).unwrap_or(u32::MAX));
-            }
-            let time_delta_ms = bw_measure_start
-                .take()
-                .map(|start| u32::try_from(start.elapsed().as_millis()).unwrap_or(u32::MAX))
-                .unwrap_or(0);
-            debug!(
-                time_delta_ms,
-                byte_count = *bw_measure_bytes,
-                "Sent connect-time bandwidth results"
-            );
-            let response = AutoDetectRspPdu::new(AutoDetectResponse::BandwidthMeasureResults {
-                sequence_number,
-                response_type: BW_RESULTS_CONNECT_TIME,
-                time_delta_ms,
-                byte_count: *bw_measure_bytes,
-            });
-            let written = encode_send_data_request(user_channel_id, message_channel_id, &response, output)?;
-            Written::from_size(written)
-        }
-        // The Network Characteristics Result ([MS-RDPBCGR] 2.2.14.1.5) is the server
-        // reporting its computed numbers back to us; it is informational, no reply.
-        _ => Ok(Written::Nothing),
-    }
-}
-
 #[expect(single_use_lifetimes)] // anonymous lifetimes in `impl Trait` are unstable
 fn create_gcc_blocks<'a>(
     config: &Config,
+    cluster_data: Option<&gcc::ClientClusterData>,
     selected_protocol: nego::SecurityProtocol,
+    extended_client_data_supported: bool,
     static_channels: impl Iterator<Item = &'a StaticVirtualChannel>,
 ) -> ConnectorResult<gcc::ClientGccBlocks> {
     use ironrdp_pdu::gcc::{
@@ -1432,7 +1772,13 @@ fn create_gcc_blocks<'a>(
 
     Ok(ClientGccBlocks {
         core: ClientCoreData {
-            version: RdpVersion::V5_PLUS,
+            // Servers ignore the relative mouse capabilities below RDP 10.12 ([MS-RDPBCGR] 2.2.1.3.2,
+            // 2.2.7.1.6), so only a client that sends relative input announces that version.
+            version: if config.relative_mouse_input {
+                RdpVersion::V10_12
+            } else {
+                RdpVersion::V5_PLUS
+            },
             desktop_width: config.desktop_size.width,
             desktop_height: config.desktop_size.height,
             color_depth: ColorDepth::Bpp8, // ignored because we use the optional core data below
@@ -1455,13 +1801,6 @@ fn create_gcc_blocks<'a>(
                         | ClientEarlyCapabilityFlags::SUPPORT_ERR_INFO_PDU
                         | ClientEarlyCapabilityFlags::STRONG_ASYMMETRIC_KEYS
                         | ClientEarlyCapabilityFlags::SUPPORT_NET_CHAR_AUTODETECT
-                        // Announce participation in the monitor-layout / dynamic-display
-                        // feature. A Windows RDS host opens the DisplayControl DVC
-                        // (MS-RDPEDISP) — which the client registers — only for a client
-                        // that advertises this flag. The server may then send a Monitor
-                        // Layout PDU during finalization, handled in
-                        // connection_finalization.rs.
-                        | ClientEarlyCapabilityFlags::SUPPORT_MONITOR_LAYOUT_PDU
                         | ClientEarlyCapabilityFlags::SUPPORT_SKIP_CHANNELJOIN;
 
                     // TODO(#136): support for ClientEarlyCapabilityFlags::SUPPORT_STATUS_INFO_PDU
@@ -1469,22 +1808,37 @@ fn create_gcc_blocks<'a>(
                     if max_color_depth == 32 {
                         early_capability_flags |= ClientEarlyCapabilityFlags::WANT_32_BPP_SESSION;
                     }
+                    if extended_client_data_supported {
+                        early_capability_flags |= ClientEarlyCapabilityFlags::SUPPORT_MONITOR_LAYOUT_PDU;
+                    }
+
+                    if config.support_dyn_vc_gfx_protocol {
+                        early_capability_flags |= ClientEarlyCapabilityFlags::SUPPORT_DYN_VC_GFX_PROTOCOL;
+                    }
+                    if config.relative_mouse_input {
+                        early_capability_flags |= ClientEarlyCapabilityFlags::RELATIVE_MOUSE_INPUT;
+                    }
 
                     Some(early_capability_flags)
                 },
                 dig_product_id: Some(config.dig_product_id.clone()),
                 connection_type: Some(config.connection_type),
                 server_selected_protocol: Some(selected_protocol),
-                desktop_physical_width: Some(0),  // 0 per FreeRDP
-                desktop_physical_height: Some(0), // 0 per FreeRDP
-                desktop_orientation: if config.desktop_size.width > config.desktop_size.height {
-                    Some(MonitorOrientation::Landscape.as_u16())
-                } else {
-                    Some(MonitorOrientation::Portrait.as_u16())
-                },
+                desktop_physical_width: Some(config.desktop_physical_size.map_or(0, |(width, _)| width)),
+                desktop_physical_height: Some(config.desktop_physical_size.map_or(0, |(_, height)| height)),
+                desktop_orientation: Some(
+                    config
+                        .desktop_orientation
+                        .unwrap_or(if config.desktop_size.width > config.desktop_size.height {
+                            MonitorOrientation::Landscape
+                        } else {
+                            MonitorOrientation::Portrait
+                        })
+                        .as_u16(),
+                ),
                 desktop_scale_factor: Some(config.desktop_scale_factor),
                 device_scale_factor: if config.desktop_scale_factor >= 100 && config.desktop_scale_factor <= 500 {
-                    Some(100)
+                    Some(config.device_scale_factor.unwrap_or(100))
                 } else {
                     Some(0)
                 },
@@ -1499,41 +1853,54 @@ fn create_gcc_blocks<'a>(
         } else {
             Some(ClientNetworkData { channels })
         },
-        // TODO(#139): support for Some(ClientClusterData { flags: RedirectionFlags::REDIRECTION_SUPPORTED, redirection_version: RedirectionVersion::V4, redirected_session_id: 0, }),
-        cluster: None,
-        // Advertise a single primary monitor covering the desktop. mstsc/FreeRDP send
-        // a monitor layout; a Windows RDS host can otherwise lack the display geometry
-        // it needs. The monitor's bounding box matches `desktop_size` (right/bottom are
-        // inclusive, hence the -1).
-        monitor: Some(gcc::ClientMonitorData {
-            monitors: vec![gcc::Monitor {
-                left: 0,
-                top: 0,
-                right: i32::from(config.desktop_size.width).saturating_sub(1),
-                bottom: i32::from(config.desktop_size.height).saturating_sub(1),
-                flags: gcc::MonitorFlags::PRIMARY,
-            }],
-        }),
+        cluster: cluster_data.cloned(),
+        monitor: extended_client_data_supported
+            .then(|| config.monitor_layout.clone())
+            .flatten(),
         // Request the MCS message channel, which carries network auto-detect
         // ([MS-RDPBCGR] 2.2.14) and the multitransport / heartbeat PDUs. The
         // server assigns its ID in Server Message Channel Data.
-        message_channel: Some(gcc::ClientMessageChannelData),
-        multi_transport_channel: config
-            .multitransport_flags
-            .map(|flags| gcc::MultiTransportChannelData { flags }),
-        monitor_extended: None,
+        message_channel: extended_client_data_supported.then_some(gcc::ClientMessageChannelData),
+        multi_transport_channel: extended_client_data_supported
+            .then(|| {
+                config
+                    .multitransport_flags
+                    .map(|flags| gcc::MultiTransportChannelData { flags })
+            })
+            .flatten(),
+        // Client Monitor Extended Data describes the monitors of Client Monitor Data, so it is
+        // only sent alongside it, with the same monitor count ([MS-RDPBCGR] 2.2.1.3.10).
+        monitor_extended: extended_client_data_supported
+            .then(|| monitor_extended_layout(config))
+            .flatten(),
     })
+}
+
+/// Returns the configured Client Monitor Extended Data when it describes every monitor of Client Monitor Data.
+fn monitor_extended_layout(config: &Config) -> Option<gcc::ClientMonitorExtendedData> {
+    let monitors = config.monitor_layout.as_ref()?.monitors.len();
+    let extended = config.monitor_extended_layout.as_ref()?;
+    if extended.extended_monitors_info.len() != monitors {
+        warn!(
+            monitors,
+            extended_monitors = extended.extended_monitors_info.len(),
+            "Omitting Client Monitor Extended Data whose monitor count differs from Client Monitor Data"
+        );
+        return None;
+    }
+    Some(extended.clone())
 }
 
 fn create_client_info_pdu(
     config: &Config,
     client_addr: &SocketAddr,
     auto_reconnect_cookie: Option<&ServerAutoReconnect>,
+    password_cookie: Option<&[u8]>,
 ) -> rdp::ClientInfoPdu {
     use ironrdp_pdu::rdp::ClientInfoPdu;
     use ironrdp_pdu::rdp::client_info::{
         AddressFamily, ClientAutoReconnect, ClientInfo, ClientInfoFlags, CompressionType, Credentials,
-        ExtendedClientInfo, ExtendedClientOptionalInfo,
+        ExtendedClientInfo, ExtendedClientOptionalInfo, PasswordCookie,
     };
     use ironrdp_pdu::rdp::headers::{BasicSecurityHeader, BasicSecurityHeaderFlags};
 
@@ -1594,6 +1961,10 @@ fn create_client_info_pdu(
             password: config.credentials.secret().to_owned(),
             domain: config.domain.clone(),
         },
+        // A smart card logon sends its PIN, never a redirection cookie.
+        password_cookie: password_cookie
+            .filter(|_| !flags.contains(ClientInfoFlags::PASSWORD_IS_SC_PIN))
+            .map(|cookie| PasswordCookie(cookie.to_vec())),
         code_page: 0, // ignored if the keyboardLayout field of the Client Core Data is set to zero
         flags,
         compression_type,
@@ -1633,11 +2004,11 @@ fn create_client_info_pdu(
 
 #[cfg(test)]
 mod tests {
-    use ironrdp_pdu::gcc;
     use ironrdp_pdu::rdp::capability_sets::{MajorPlatformType, RailSupportLevel};
     use ironrdp_pdu::rdp::client_info::ClientInfoFlags;
+    use ironrdp_pdu::{gcc, nego};
 
-    use super::create_client_info_pdu;
+    use super::{create_client_info_pdu, create_gcc_blocks};
     use crate::{Config, Credentials, DesktopSize};
 
     #[test]
@@ -1647,7 +2018,13 @@ mod tests {
                 width: 1024,
                 height: 768,
             },
+            monitor_layout: None,
             desktop_scale_factor: 0,
+            desktop_physical_size: None,
+            desktop_orientation: None,
+            device_scale_factor: None,
+            monitor_extended_layout: None,
+            relative_mouse_input: false,
             enable_tls: true,
             enable_credssp: false,
             enable_standard_rdp_security: false,
@@ -1658,7 +2035,7 @@ mod tests {
             domain: None,
             client_build: 0,
             client_name: "test".into(),
-            keyboard_type: gcc::KeyboardType::IbmEnhanced,
+            keyboard_type: gcc::KeyboardType::IBM_ENHANCED,
             keyboard_subtype: 0,
             keyboard_functional_keys_count: 12,
             keyboard_layout: 0,
@@ -1684,9 +2061,10 @@ mod tests {
             enable_server_pointer: false,
             pointer_software_rendering: false,
             multitransport_flags: None,
+            support_dyn_vc_gfx_protocol: false,
         };
 
-        let client_info = create_client_info_pdu(&config, &"127.0.0.1:3389".parse().unwrap(), None).client_info;
+        let client_info = create_client_info_pdu(&config, &"127.0.0.1:3389".parse().unwrap(), None, None).client_info;
 
         assert!(client_info.flags.contains(ClientInfoFlags::RAIL));
         assert!(client_info.alternate_shell.is_empty());
@@ -1701,7 +2079,13 @@ mod tests {
                 width: 1024,
                 height: 768,
             },
+            monitor_layout: None,
             desktop_scale_factor: 0,
+            desktop_physical_size: None,
+            desktop_orientation: None,
+            device_scale_factor: None,
+            monitor_extended_layout: None,
+            relative_mouse_input: false,
             enable_tls: true,
             enable_credssp: false,
             enable_standard_rdp_security: false,
@@ -1712,7 +2096,7 @@ mod tests {
             domain: None,
             client_build: 0,
             client_name: "test".into(),
-            keyboard_type: gcc::KeyboardType::IbmEnhanced,
+            keyboard_type: gcc::KeyboardType::IBM_ENHANCED,
             keyboard_subtype: 0,
             keyboard_functional_keys_count: 12,
             keyboard_layout: 0,
@@ -1738,14 +2122,191 @@ mod tests {
             enable_server_pointer: false,
             pointer_software_rendering: false,
             multitransport_flags: None,
+            support_dyn_vc_gfx_protocol: false,
         };
 
-        let client_info = create_client_info_pdu(&config, &"127.0.0.1:3389".parse().unwrap(), None).client_info;
+        let client_info = create_client_info_pdu(&config, &"127.0.0.1:3389".parse().unwrap(), None, None).client_info;
         assert!(client_info.flags.contains(ClientInfoFlags::AUDIO_CAPTURE));
         assert!(!client_info.flags.contains(ClientInfoFlags::NO_AUDIO_PLAYBACK));
 
         config.enable_audio_capture = false;
-        let client_info = create_client_info_pdu(&config, &"127.0.0.1:3389".parse().unwrap(), None).client_info;
+        let client_info = create_client_info_pdu(&config, &"127.0.0.1:3389".parse().unwrap(), None, None).client_info;
         assert!(!client_info.flags.contains(ClientInfoFlags::AUDIO_CAPTURE));
+    }
+
+    #[test]
+    fn gcc_blocks_advertise_monitor_layout_when_supported() {
+        let mut config = Config {
+            desktop_size: DesktopSize {
+                width: 1_920,
+                height: 1_080,
+            },
+            monitor_layout: Some(gcc::ClientMonitorData {
+                monitors: vec![gcc::Monitor {
+                    left: 0,
+                    top: 0,
+                    right: 1_919,
+                    bottom: 1_079,
+                    flags: gcc::MonitorFlags::PRIMARY,
+                }],
+            }),
+            desktop_scale_factor: 0,
+            desktop_physical_size: None,
+            desktop_orientation: None,
+            device_scale_factor: None,
+            monitor_extended_layout: None,
+            relative_mouse_input: false,
+            enable_tls: true,
+            enable_credssp: false,
+            enable_standard_rdp_security: false,
+            credentials: Credentials::UsernamePassword {
+                username: "test".into(),
+                password: "test".into(),
+            },
+            domain: None,
+            client_build: 0,
+            client_name: "test".into(),
+            keyboard_type: gcc::KeyboardType::IBM_ENHANCED,
+            keyboard_subtype: 0,
+            keyboard_functional_keys_count: 12,
+            keyboard_layout: 0,
+            connection_type: gcc::ConnectionType::Lan,
+            ime_file_name: String::new(),
+            bitmap: None,
+            dig_product_id: String::new(),
+            client_dir: String::new(),
+            alternate_shell: String::new(),
+            work_dir: String::new(),
+            remote_application_mode: false,
+            rail_support_level: RailSupportLevel::empty(),
+            platform: MajorPlatformType::UNIX,
+            hardware_id: None,
+            request_data: None,
+            autologon: false,
+            enable_audio_playback: false,
+            enable_audio_capture: false,
+            performance_flags: Default::default(),
+            license_cache: None,
+            timezone_info: Default::default(),
+            compression_type: None,
+            enable_server_pointer: false,
+            pointer_software_rendering: false,
+            multitransport_flags: None,
+            support_dyn_vc_gfx_protocol: false,
+        };
+
+        let blocks = create_gcc_blocks(
+            &config,
+            None,
+            nego::SecurityProtocol::empty(),
+            true,
+            core::iter::empty(),
+        )
+        .expect("valid GCC Client Monitor Data");
+
+        assert_eq!(blocks.monitor, config.monitor_layout);
+        assert!(blocks.monitor_extended.is_none());
+        assert!(
+            blocks
+                .core
+                .optional_data
+                .early_capability_flags
+                .expect("early capability flags are present")
+                .contains(gcc::ClientEarlyCapabilityFlags::SUPPORT_MONITOR_LAYOUT_PDU)
+        );
+
+        let monitor_extended = gcc::ClientMonitorExtendedData {
+            extended_monitors_info: vec![gcc::ExtendedMonitorInfo {
+                physical_width: 0,
+                physical_height: 0,
+                orientation: gcc::MonitorOrientation::Portrait,
+                desktop_scale_factor: 150,
+                device_scale_factor: 140,
+            }],
+        };
+        config.monitor_extended_layout = Some(monitor_extended.clone());
+        let blocks = create_gcc_blocks(
+            &config,
+            None,
+            nego::SecurityProtocol::empty(),
+            true,
+            core::iter::empty(),
+        )
+        .expect("valid GCC Client Monitor Extended Data");
+        assert_eq!(blocks.monitor_extended, Some(monitor_extended.clone()));
+
+        // A count that differs from Client Monitor Data would be a nonconformant block.
+        let mut mismatched = monitor_extended;
+        mismatched
+            .extended_monitors_info
+            .push(mismatched.extended_monitors_info[0].clone());
+        config.monitor_extended_layout = Some(mismatched);
+        let blocks = create_gcc_blocks(
+            &config,
+            None,
+            nego::SecurityProtocol::empty(),
+            true,
+            core::iter::empty(),
+        )
+        .expect("valid GCC Client Monitor Data");
+        assert!(blocks.monitor_extended.is_none());
+
+        // Extended data describes the monitors of Client Monitor Data, so it is not sent alone.
+        config.monitor_layout = None;
+        let blocks = create_gcc_blocks(
+            &config,
+            None,
+            nego::SecurityProtocol::empty(),
+            true,
+            core::iter::empty(),
+        )
+        .expect("valid GCC Client Monitor Data");
+
+        assert!(blocks.monitor.is_none());
+        assert!(blocks.monitor_extended.is_none());
+        assert!(
+            blocks
+                .core
+                .optional_data
+                .early_capability_flags
+                .expect("early capability flags are present")
+                .contains(gcc::ClientEarlyCapabilityFlags::SUPPORT_MONITOR_LAYOUT_PDU)
+        );
+
+        let blocks = create_gcc_blocks(
+            &config,
+            None,
+            nego::SecurityProtocol::empty(),
+            false,
+            core::iter::empty(),
+        )
+        .expect("valid GCC Client Monitor Data");
+
+        assert!(blocks.monitor.is_none());
+        assert!(blocks.message_channel.is_none());
+        assert!(blocks.multi_transport_channel.is_none());
+        assert!(
+            !blocks
+                .core
+                .optional_data
+                .early_capability_flags
+                .expect("early capability flags are present")
+                .contains(gcc::ClientEarlyCapabilityFlags::SUPPORT_MONITOR_LAYOUT_PDU)
+        );
+
+        let cluster_data = gcc::ClientClusterData {
+            flags: gcc::RedirectionFlags::REDIRECTION_SUPPORTED | gcc::RedirectionFlags::REDIRECTED_SESSION_FIELD_VALID,
+            redirection_version: gcc::RedirectionVersion::V6,
+            redirected_session_id: 0,
+        };
+        let blocks = create_gcc_blocks(
+            &config,
+            Some(&cluster_data),
+            nego::SecurityProtocol::empty(),
+            true,
+            core::iter::empty(),
+        )
+        .expect("valid GCC Client Cluster Data");
+        assert_eq!(blocks.cluster, Some(cluster_data));
     }
 }

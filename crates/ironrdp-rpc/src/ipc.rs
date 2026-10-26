@@ -24,15 +24,66 @@ use ironrdp_rdpei::pdu::{
 };
 
 use crate::wire::{
-    bytes_size, opt_string_size, opt_u16_size, opt_u64_size, propertyset, read_bool, read_bytes, read_char,
-    read_mouse_button, read_opt_string, read_opt_u16, read_opt_u64, read_string, string_size, write_bool, write_bytes,
-    write_char, write_mouse_button, write_opt_string, write_opt_u16, write_opt_u64, write_string,
+    bytes_size, opt_bytes_size, opt_string_size, opt_u16_size, opt_u64_size, propertyset, read_bool, read_bytes,
+    read_char, read_mouse_button, read_opt_bytes, read_opt_string, read_opt_u16, read_opt_u64, read_string,
+    string_size, write_bool, write_bytes, write_char, write_mouse_button, write_opt_bytes, write_opt_string,
+    write_opt_u16, write_opt_u64, write_string,
 };
 
 /// Maximum number of Unicode scalar values accepted in one [`Request::UnicodeText`] request.
 ///
 /// The agent reserves one bounded input-queue entry for each character before submitting any text.
 pub const MAX_UNICODE_TEXT_CHARS: usize = 96;
+
+/// Maximum key press/release operations delivered in one atomic input request.
+pub const MAX_KEY_BATCH_EVENTS: usize = 10;
+
+/// One key operation in a bounded [`Request::KeyBatch`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyInput {
+    Scancode { scancode: u16, pressed: bool },
+    Unicode { ch: char, pressed: bool },
+}
+
+/// Maximum size in bytes of a PNG accepted by [`Request::ClipboardSetImage`].
+///
+/// This is an RPC payload bound, derived from [`crate::transport::MAX_MESSAGE_LEN`] (the hard cap
+/// on one framed message) minus headroom for the rest of the `Request`/`Response` encoding. It is
+/// deliberately not derived from `ironrdp_cliprdr_format::bitmap`'s own internal decoded-buffer
+/// cap: That bounds the *decoded* pixel data, a different and unrelated quantity from this
+/// *compressed* PNG input size. A PNG under this limit can still fail that separate decode-time
+/// check (a highly compressible PNG can expand well past it), and this check alone does not
+/// guarantee a successful conversion.
+pub const MAX_CLIPBOARD_IMAGE_BYTES: usize = crate::transport::MAX_MESSAGE_LEN - CLIPBOARD_IMAGE_FRAME_HEADROOM;
+
+/// Headroom subtracted from [`crate::transport::MAX_MESSAGE_LEN`] to get
+/// [`MAX_CLIPBOARD_IMAGE_BYTES`], covering the rest of the `Request`/`Response` encoding
+/// (discriminant, length prefixes, any other fields). Generous on purpose: The actual overhead is
+/// a handful of bytes, but this only needs to be safely conservative, not exact.
+const CLIPBOARD_IMAGE_FRAME_HEADROOM: usize = 4 * 1024;
+
+/// Maximum size in bytes of an HTML fragment accepted by [`Request::ClipboardSetHtml`].
+///
+/// Generous for a clipboard fragment (a typical rich-text paste is a few KB) while still bounded;
+/// this is a plain-text CLI argument, not a file, so it stays well under the image cap.
+pub const MAX_CLIPBOARD_HTML_BYTES: usize = 256 * 1024;
+
+/// Maximum size in bytes of one file fetched via [`Request::ClipboardGetFile`].
+///
+/// Same rationale as [`MAX_CLIPBOARD_IMAGE_BYTES`]: derived from the transport's own frame limit,
+/// not an unrelated constant that could exceed what a single IPC message can actually carry. The
+/// daemon also bounds the fetch itself against this ceiling before issuing any wire request for
+/// the file's contents, so an oversized remote file is rejected before any bytes are pulled over
+/// the RDP session, not just before the IPC response is framed.
+pub const MAX_CLIPBOARD_FILE_BYTES: usize = crate::transport::MAX_MESSAGE_LEN - CLIPBOARD_IMAGE_FRAME_HEADROOM;
+
+/// Maximum entries accepted in one [`Request::ClipboardSetFiles`] or returned by
+/// [`Request::ClipboardListFiles`].
+///
+/// Generous for a real folder copy while still bounding decode-time allocation and the size of a
+/// CLI listing. `ironrdp_cliprdr` itself caps a wire file list at 100,000 entries as a separate,
+/// lower-level defense; this is an independent, smaller IPC-level bound.
+pub const MAX_CLIPBOARD_FILE_LIST_ENTRIES: usize = 10_000;
 
 /// Maximum contacts in one MS-RDPEI touch frame accepted over RPC.
 pub const MAX_TOUCH_CONTACTS: usize = 10;
@@ -42,9 +93,9 @@ pub const MAX_TOUCH_FRAMES: usize = 64;
 
 /// Maximum contacts in one MS-RDPEI pen frame accepted over RPC.
 ///
-/// Clients currently construct [`ironrdp_rdpei::RdpeiClient::default`], which advertises V200 with
-/// empty `CS_READY` feature flags. Until multi-pen negotiation is plumbed through, only a single
-/// pen contact with `deviceId == 0` is accepted ([MS-RDPEI] 3.1.1.1).
+/// The session enables multipen injection only when the server supports it, and RPC callers cannot
+/// see that negotiation, so only a single pen contact with `deviceId == 0` is accepted
+/// ([MS-RDPEI] 2.2.3.7.1.1).
 pub const MAX_PEN_CONTACTS: usize = 1;
 
 /// Maximum pen frames in one [`Request::Pen`] PDU accepted over RPC.
@@ -104,6 +155,56 @@ pub struct PenFrameRequest {
     /// Microseconds since the previous frame (`0` for the first frame of a transaction).
     pub frame_offset: u64,
     pub contacts: Vec<PenContactRequest>,
+}
+
+/// One file's metadata: either offered locally via [`Request::ClipboardSetFiles`] (derived from
+/// the local filesystem) or listed from the remote via [`Request::ClipboardListFiles`] (as
+/// advertised over `CLIPRDR`, name-sanitized already by `ironrdp_cliprdr`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClipboardFileEntry {
+    pub name: String,
+    /// Directory portion of the path within the copied collection, `\`-separated. `None` for a
+    /// file at the root of the collection.
+    pub relative_path: Option<String>,
+    pub is_directory: bool,
+    /// Absent when the remote did not declare a size (directories never carry one; some peers
+    /// omit it for files too, which forces a `SIZE` round-trip before a fetch can begin).
+    pub size: Option<u64>,
+    /// Last write time as Unix seconds, converted from the wire's Windows FILETIME (100-ns
+    /// intervals since 1601-01-01). `None` when the remote did not declare one.
+    pub last_write_time: Option<u64>,
+}
+
+fn clipboard_file_entry_size(entry: &ClipboardFileEntry) -> usize {
+    string_size(&entry.name)
+        + opt_string_size(entry.relative_path.as_deref())
+        + 1 /* is_directory */
+        + opt_u64_size(entry.size)
+        + opt_u64_size(entry.last_write_time)
+}
+
+fn write_clipboard_file_entry(dst: &mut WriteCursor<'_>, entry: &ClipboardFileEntry) -> EncodeResult<()> {
+    write_string(dst, &entry.name)?;
+    write_opt_string(dst, entry.relative_path.as_deref())?;
+    write_bool(dst, entry.is_directory)?;
+    write_opt_u64(dst, entry.size)?;
+    write_opt_u64(dst, entry.last_write_time)?;
+    Ok(())
+}
+
+fn read_clipboard_file_entry(src: &mut ReadCursor<'_>) -> DecodeResult<ClipboardFileEntry> {
+    let name = read_string(src)?;
+    let relative_path = read_opt_string(src)?;
+    let is_directory = read_bool(src)?;
+    let size = read_opt_u64(src)?;
+    let last_write_time = read_opt_u64(src)?;
+    Ok(ClipboardFileEntry {
+        name,
+        relative_path,
+        is_directory,
+        size,
+        last_write_time,
+    })
 }
 
 /// Validates and converts an RPC touch request into an MS-RDPEI touch event PDU.
@@ -346,6 +447,10 @@ pub enum Request {
     },
     /// Tear down the current RDP session (the daemon keeps running).
     Disconnect,
+    /// Disconnect only if the active session belongs to `server` (`host[:port]`).
+    DisconnectMatching { server: String },
+    /// Shut down the daemon after its reply has been written.
+    DaemonStop,
     /// Query the current session status.
     Status,
     /// Query the live session property bag, optionally filtered.
@@ -370,6 +475,8 @@ pub enum Request {
     KeyScancode { scancode: u16, pressed: bool },
     /// Press or release a key identified by a Unicode character.
     KeyUnicode { ch: char, pressed: bool },
+    /// Deliver one complete key sequence in order through a single input transaction.
+    KeyBatch { events: Vec<KeyInput> },
     /// Type bounded Unicode text in ordered FastPath input messages.
     UnicodeText { text: String },
     /// Resize the remote desktop.
@@ -438,8 +545,29 @@ pub enum Request {
     },
     /// Queue a validated RAIL Execute request.
     RailExecute(RailExecuteRequest),
-    // TODO: add clipboard support (CLIPRDR), e.g. requests to read the remote clipboard text and to
-    // set it, so an LLM can copy/paste to and from the session.
+    /// Return the last text received from the remote clipboard, if any.
+    ClipboardGet,
+    /// Set the local clipboard text and advertise it to the remote (`CF_UNICODETEXT` only).
+    ClipboardSet { text: String },
+    /// Return the last image received from the remote clipboard as PNG bytes, if any.
+    ClipboardGetImage,
+    /// Set the local clipboard image (PNG bytes, at most [`MAX_CLIPBOARD_IMAGE_BYTES`]) and
+    /// advertise it to the remote as `CF_DIB`/`CF_DIBV5`.
+    ClipboardSetImage { png: Vec<u8> },
+    /// Return the last HTML fragment received from the remote clipboard, if any.
+    ClipboardGetHtml,
+    /// Set the local clipboard HTML fragment (at most [`MAX_CLIPBOARD_HTML_BYTES`]) and advertise
+    /// it to the remote as the registered `HTML Format`.
+    ClipboardSetHtml { html: String },
+    /// Offer local files (at most [`MAX_CLIPBOARD_FILE_LIST_ENTRIES`] paths) to the remote via
+    /// the `CLIPRDR` file-list mechanism (`FileGroupDescriptorW`), replacing any previous local
+    /// clipboard content. Each path names a single regular file; a directory path is rejected.
+    ClipboardSetFiles { paths: Vec<String> },
+    /// List the remote's currently offered files, if any (metadata only; nothing is fetched).
+    ClipboardListFiles,
+    /// Fetch one file's full contents from the remote by its position in the last file list
+    /// [`Request::ClipboardListFiles`] returned, bounded at [`MAX_CLIPBOARD_FILE_BYTES`].
+    ClipboardGetFile { index: i32 },
 }
 
 // Manual `Debug` so the `Connect` payload's property *values* (which may include a password before
@@ -456,6 +584,10 @@ impl fmt::Debug for Request {
                 .field("log_directive", log_directive)
                 .finish(),
             Self::Disconnect => f.write_str("Disconnect"),
+            Self::DisconnectMatching { server } => {
+                f.debug_struct("DisconnectMatching").field("server", server).finish()
+            }
+            Self::DaemonStop => f.write_str("DaemonStop"),
             Self::Status => f.write_str("Status"),
             Self::QueryProps { filter } => f.debug_struct("QueryProps").field("filter", filter).finish(),
             Self::QueryLogs { substring, last } => f
@@ -485,6 +617,7 @@ impl fmt::Debug for Request {
                 .field("ch", ch)
                 .field("pressed", pressed)
                 .finish(),
+            Self::KeyBatch { events } => f.debug_struct("KeyBatch").field("count", &events.len()).finish(),
             Self::UnicodeText { text } => f
                 .debug_struct("UnicodeText")
                 .field("char_count", &text.chars().count())
@@ -555,6 +688,27 @@ impl fmt::Debug for Request {
                 .field("timeout_ms", timeout_ms)
                 .finish(),
             Self::RailExecute(request) => f.debug_tuple("RailExecute").field(request).finish(),
+            Self::ClipboardGet => f.write_str("ClipboardGet"),
+            // Never print clipboard contents.
+            Self::ClipboardSet { text } => f.debug_struct("ClipboardSet").field("text_len", &text.len()).finish(),
+            Self::ClipboardGetImage => f.write_str("ClipboardGetImage"),
+            Self::ClipboardSetImage { png } => f
+                .debug_struct("ClipboardSetImage")
+                .field("png_len", &png.len())
+                .finish(),
+            Self::ClipboardGetHtml => f.write_str("ClipboardGetHtml"),
+            Self::ClipboardSetHtml { html } => f
+                .debug_struct("ClipboardSetHtml")
+                .field("html_len", &html.len())
+                .finish(),
+            // Never print file paths or names: they can carry as much sensitive information as
+            // clipboard text or file contents.
+            Self::ClipboardSetFiles { paths } => f
+                .debug_struct("ClipboardSetFiles")
+                .field("path_count", &paths.len())
+                .finish(),
+            Self::ClipboardListFiles => f.write_str("ClipboardListFiles"),
+            Self::ClipboardGetFile { index } => f.debug_struct("ClipboardGetFile").field("index", index).finish(),
         }
     }
 }
@@ -631,6 +785,17 @@ pub enum Payload {
     RailEvents(RailEventDump),
     /// A locally assigned RAIL launch identifier.
     RailLaunch(RailLaunchInfo),
+    /// The remote clipboard's last `CF_UNICODETEXT` text, or `None` if unavailable.
+    ClipboardText(Option<String>),
+    /// The remote clipboard's last image as PNG bytes, or `None` if unavailable.
+    ClipboardImage(Option<Vec<u8>>),
+    /// The remote clipboard's last HTML fragment, or `None` if unavailable.
+    ClipboardHtml(Option<String>),
+    /// The remote's currently offered files (metadata only), or `None` if the remote is not
+    /// currently offering any.
+    ClipboardFileList(Option<Vec<ClipboardFileEntry>>),
+    /// The full contents of one file fetched via [`Request::ClipboardGetFile`].
+    ClipboardFile(Vec<u8>),
 }
 
 impl fmt::Debug for Payload {
@@ -655,6 +820,25 @@ impl fmt::Debug for Payload {
             Self::RailStatus(status) => f.debug_tuple("RailStatus").field(status).finish(),
             Self::RailEvents(events) => f.debug_tuple("RailEvents").field(events).finish(),
             Self::RailLaunch(launch) => f.debug_tuple("RailLaunch").field(launch).finish(),
+            // Never print clipboard contents.
+            Self::ClipboardText(text) => f
+                .debug_tuple("ClipboardText")
+                .field(&text.as_ref().map(String::len))
+                .finish(),
+            Self::ClipboardImage(png) => f
+                .debug_tuple("ClipboardImage")
+                .field(&png.as_ref().map(Vec::len))
+                .finish(),
+            Self::ClipboardHtml(html) => f
+                .debug_tuple("ClipboardHtml")
+                .field(&html.as_ref().map(String::len))
+                .finish(),
+            // File names can be as sensitive as clipboard text; print counts only.
+            Self::ClipboardFileList(files) => f
+                .debug_tuple("ClipboardFileList")
+                .field(&files.as_ref().map(Vec::len))
+                .finish(),
+            Self::ClipboardFile(data) => f.debug_tuple("ClipboardFile").field(&data.len()).finish(),
         }
     }
 }
@@ -752,6 +936,7 @@ pub enum RailEventKind {
         kind: String,
     },
     WindowingOrders {
+        /// Size of the orders as one slow-path Orders update, including its `updateType` field.
         byte_count: u32,
     },
     /// History before this sequence was evicted from the bounded ledger.
@@ -1119,6 +1304,20 @@ pub struct StatusInfo {
     /// When set, a caller driving `connect` does not need to supply a password (or other secrets):
     /// the daemon layers the overlay on top of the request before building the configuration.
     pub credentials_loaded: bool,
+    /// The server certificate that failed strict validation and is not trusted, when that is why the
+    /// session failed. Interactive callers can offer to trust it and reconnect.
+    pub untrusted_certificate: Option<Box<UntrustedCertificate>>,
+}
+
+/// A server certificate rejected by strict validation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UntrustedCertificate {
+    /// TLS endpoint (`host:port`) that presented the certificate.
+    pub endpoint: String,
+    /// Lowercase hex SHA-256 fingerprint of the DER certificate.
+    pub sha256: String,
+    /// Why validation failed.
+    pub reason: String,
 }
 
 /// A bulk dump of live properties.
@@ -1308,7 +1507,7 @@ impl Decode<'_> for KeyFilter {
         match src.read_u8() {
             0 => Ok(Self::Substring(read_string(src)?)),
             1 => Ok(Self::Prefix(read_string(src)?)),
-            _ => Err(ironrdp_core::invalid_field_err!("key filter", "unknown tag")),
+            _ => Err(ironrdp_core::invalid_field_err!("key filter", "unknown tag", in: src)),
         }
     }
 }
@@ -1355,7 +1554,7 @@ impl Decode<'_> for PropValue {
                 Ok(Self::Int(src.read_i64()))
             }
             1 => Ok(Self::Str(read_string(src)?)),
-            _ => Err(ironrdp_core::invalid_field_err!("property value", "unknown tag")),
+            _ => Err(ironrdp_core::invalid_field_err!("property value", "unknown tag", in: src)),
         }
     }
 }
@@ -1391,7 +1590,7 @@ impl_pdu_pod!(PropertyEntry);
 impl Encode for PropertyDump {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
         ensure_size!(in: dst, size: self.size());
-        let count: u32 = cast_length!("property count", self.entries.len())?;
+        let count: u32 = cast_length!("property count", self.entries.len(), in: dst)?;
         dst.write_u32(count);
         for entry in &self.entries {
             entry.encode(dst)?;
@@ -1432,7 +1631,14 @@ impl Encode for StatusInfo {
         write_opt_u16(dst, self.width)?;
         write_opt_u16(dst, self.height)?;
         write_opt_string(dst, self.message.as_deref())?;
-        write_bool(dst, self.credentials_loaded)
+        write_bool(dst, self.credentials_loaded)?;
+        write_bool(dst, self.untrusted_certificate.is_some())?;
+        if let Some(certificate) = &self.untrusted_certificate {
+            write_string(dst, &certificate.endpoint)?;
+            write_string(dst, &certificate.sha256)?;
+            write_string(dst, &certificate.reason)?;
+        }
+        Ok(())
     }
 
     fn name(&self) -> &'static str {
@@ -1446,6 +1652,10 @@ impl Encode for StatusInfo {
             + opt_u16_size(self.height)
             + opt_string_size(self.message.as_deref())
             + 1 /* credentials_loaded */
+            + 1 /* untrusted_certificate presence */
+            + self.untrusted_certificate.as_ref().map_or(0, |certificate| {
+                string_size(&certificate.endpoint) + string_size(&certificate.sha256) + string_size(&certificate.reason)
+            })
     }
 }
 
@@ -1458,6 +1668,17 @@ impl Decode<'_> for StatusInfo {
         let height = read_opt_u16(src)?;
         let message = read_opt_string(src)?;
         let credentials_loaded = read_bool(src)?;
+        let untrusted_certificate = if src.is_empty() {
+            None
+        } else if read_bool(src)? {
+            Some(Box::new(UntrustedCertificate {
+                endpoint: read_string(src)?,
+                sha256: read_string(src)?,
+                reason: read_string(src)?,
+            }))
+        } else {
+            None
+        };
         Ok(Self {
             state,
             destination,
@@ -1465,6 +1686,7 @@ impl Decode<'_> for StatusInfo {
             height,
             message,
             credentials_loaded,
+            untrusted_certificate,
         })
     }
 }
@@ -1925,7 +2147,7 @@ impl Encode for Payload {
             }
             Self::Logs(lines) => {
                 dst.write_u8(3);
-                let count: u32 = cast_length!("log line count", lines.len())?;
+                let count: u32 = cast_length!("log line count", lines.len(), in: dst)?;
                 dst.write_u32(count);
                 for line in lines {
                     write_string(dst, line)?;
@@ -1947,7 +2169,7 @@ impl Encode for Payload {
             }
             Self::NowOperations(operations) => {
                 dst.write_u8(7);
-                let count: u32 = cast_length!("operation count", operations.len())?;
+                let count: u32 = cast_length!("operation count", operations.len(), in: dst)?;
                 dst.write_u32(count);
                 for operation in operations {
                     operation.encode(dst)?;
@@ -1973,6 +2195,33 @@ impl Encode for Payload {
                 dst.write_u8(12);
                 launch.encode(dst)?;
             }
+            Self::ClipboardText(text) => {
+                dst.write_u8(13);
+                write_opt_string(dst, text.as_deref())?;
+            }
+            Self::ClipboardImage(png) => {
+                dst.write_u8(14);
+                write_opt_bytes(dst, png.as_deref())?;
+            }
+            Self::ClipboardHtml(html) => {
+                dst.write_u8(15);
+                write_opt_string(dst, html.as_deref())?;
+            }
+            Self::ClipboardFileList(files) => {
+                dst.write_u8(16);
+                write_bool(dst, files.is_some())?;
+                if let Some(files) = files {
+                    let file_count: u16 = cast_length!("clipboard file list count", files.len())?;
+                    dst.write_u16(file_count);
+                    for file in files {
+                        write_clipboard_file_entry(dst, file)?;
+                    }
+                }
+            }
+            Self::ClipboardFile(data) => {
+                dst.write_u8(17);
+                write_bytes(dst, data)?;
+            }
         }
         Ok(())
     }
@@ -1997,6 +2246,16 @@ impl Encode for Payload {
                 Self::RailStatus(status) => status.size(),
                 Self::RailEvents(events) => events.size(),
                 Self::RailLaunch(launch) => launch.size(),
+                Self::ClipboardText(text) => opt_string_size(text.as_deref()),
+                Self::ClipboardImage(png) => opt_bytes_size(png.as_deref()),
+                Self::ClipboardHtml(html) => opt_string_size(html.as_deref()),
+                Self::ClipboardFileList(files) => {
+                    1 /* presence */
+                        + files.as_ref().map_or(0, |files| {
+                            2 /* file_count */ + files.iter().map(clipboard_file_entry_size).sum::<usize>()
+                        })
+                }
+                Self::ClipboardFile(data) => bytes_size(data),
             }
     }
 }
@@ -2040,7 +2299,48 @@ impl Decode<'_> for Payload {
             10 => Ok(Self::RailStatus(RailStatusInfo::decode(src)?)),
             11 => Ok(Self::RailEvents(RailEventDump::decode(src)?)),
             12 => Ok(Self::RailLaunch(RailLaunchInfo::decode(src)?)),
-            _ => Err(ironrdp_core::invalid_field_err!("payload", "unknown tag")),
+            13 => Ok(Self::ClipboardText(read_opt_string(src)?)),
+            14 => {
+                let png = read_opt_bytes(src)?;
+                if png.as_ref().is_some_and(|png| png.len() > MAX_CLIPBOARD_IMAGE_BYTES) {
+                    return Err(ironrdp_core::invalid_field_err!("clipboard image", "too large"));
+                }
+                Ok(Self::ClipboardImage(png))
+            }
+            15 => {
+                let html = read_opt_string(src)?;
+                if html.as_ref().is_some_and(|html| html.len() > MAX_CLIPBOARD_HTML_BYTES) {
+                    return Err(ironrdp_core::invalid_field_err!("clipboard html", "too large", in: src));
+                }
+                Ok(Self::ClipboardHtml(html))
+            }
+            16 => {
+                let present = read_bool(src)?;
+                if !present {
+                    return Ok(Self::ClipboardFileList(None));
+                }
+                ensure_size!(in: src, size: 2);
+                let file_count = usize::from(src.read_u16());
+                if file_count > MAX_CLIPBOARD_FILE_LIST_ENTRIES {
+                    return Err(ironrdp_core::invalid_field_err!(
+                        "clipboard file list",
+                        "too many entries"
+                    ));
+                }
+                let mut files = Vec::with_capacity(file_count);
+                for _ in 0..file_count {
+                    files.push(read_clipboard_file_entry(src)?);
+                }
+                Ok(Self::ClipboardFileList(Some(files)))
+            }
+            17 => {
+                let data = read_bytes(src)?;
+                if data.len() > MAX_CLIPBOARD_FILE_BYTES {
+                    return Err(ironrdp_core::invalid_field_err!("clipboard file", "too large"));
+                }
+                Ok(Self::ClipboardFile(data))
+            }
+            _ => Err(ironrdp_core::invalid_field_err!("payload", "unknown tag", in: src)),
         }
     }
 }
@@ -2083,7 +2383,7 @@ impl Decode<'_> for Response {
         match src.read_u8() {
             0 => Ok(Self::Ok(Payload::decode(src)?)),
             1 => Ok(Self::Err(AgentError::decode(src)?)),
-            _ => Err(ironrdp_core::invalid_field_err!("response", "unknown tag")),
+            _ => Err(ironrdp_core::invalid_field_err!("response", "unknown tag", in: src)),
         }
     }
 }
@@ -2105,6 +2405,11 @@ impl Encode for Request {
                 write_opt_string(dst, log_directive.as_deref())?;
             }
             Self::Disconnect => dst.write_u8(1),
+            Self::DisconnectMatching { server } => {
+                dst.write_u8(39);
+                write_string(dst, server)?;
+            }
+            Self::DaemonStop => dst.write_u8(38),
             Self::Status => dst.write_u8(2),
             Self::QueryProps { filter } => {
                 dst.write_u8(3);
@@ -2152,6 +2457,27 @@ impl Encode for Request {
                 dst.write_u8(10);
                 write_char(dst, *ch)?;
                 write_bool(dst, *pressed)?;
+            }
+            Self::KeyBatch { events } => {
+                if events.is_empty() || events.len() > MAX_KEY_BATCH_EVENTS {
+                    return Err(ironrdp_core::invalid_field_err!("key batch", "invalid event count", in: dst));
+                }
+                dst.write_u8(40);
+                dst.write_u8(cast_length!("key batch count", events.len())?);
+                for event in events {
+                    match event {
+                        KeyInput::Scancode { scancode, pressed } => {
+                            dst.write_u8(0);
+                            dst.write_u16(*scancode);
+                            write_bool(dst, *pressed)?;
+                        }
+                        KeyInput::Unicode { ch, pressed } => {
+                            dst.write_u8(1);
+                            write_char(dst, *ch)?;
+                            write_bool(dst, *pressed)?;
+                        }
+                    }
+                }
             }
             Self::UnicodeText { text } => {
                 dst.write_u8(21);
@@ -2255,6 +2581,35 @@ impl Encode for Request {
                 dst.write_u8(28);
                 dst.write_u8(*contact_id);
             }
+            // Tags 29-32: free after DismissHoveringTouchContact (28).
+            Self::ClipboardGet => dst.write_u8(29),
+            Self::ClipboardSet { text } => {
+                dst.write_u8(30);
+                write_string(dst, text)?;
+            }
+            Self::ClipboardGetImage => dst.write_u8(31),
+            Self::ClipboardSetImage { png } => {
+                dst.write_u8(32);
+                write_bytes(dst, png)?;
+            }
+            Self::ClipboardGetHtml => dst.write_u8(33),
+            Self::ClipboardSetHtml { html } => {
+                dst.write_u8(34);
+                write_string(dst, html)?;
+            }
+            Self::ClipboardSetFiles { paths } => {
+                dst.write_u8(35);
+                let path_count: u16 = cast_length!("clipboard file path count", paths.len())?;
+                dst.write_u16(path_count);
+                for path in paths {
+                    write_string(dst, path)?;
+                }
+            }
+            Self::ClipboardListFiles => dst.write_u8(36),
+            Self::ClipboardGetFile { index } => {
+                dst.write_u8(37);
+                dst.write_i32(*index);
+            }
         }
         Ok(())
     }
@@ -2270,12 +2625,17 @@ impl Encode for Request {
                     propertyset::size(properties) + opt_string_size(log_directive.as_deref())
                 }
                 Self::Disconnect
+                | Self::DaemonStop
                 | Self::Status
                 | Self::Screenshot
                 | Self::NowCapabilities
                 | Self::NowList
                 | Self::NowDiagnostics
-                | Self::RailStatus => 0,
+                | Self::RailStatus
+                | Self::ClipboardGet
+                | Self::ClipboardGetImage
+                | Self::ClipboardGetHtml => 0,
+                Self::DisconnectMatching { server } => string_size(server),
                 Self::QueryProps { filter } => 1 /* presence */ + filter.as_ref().map_or(0, Encode::size),
                 Self::QueryLogs { substring, last } => {
                     opt_string_size(substring.as_deref()) + 1 /* presence */ + last.map_or(0, |_| 4)
@@ -2285,6 +2645,13 @@ impl Encode for Request {
                 Self::Wheel { .. } => 2 /* delta */ + 1 /* horizontal */,
                 Self::KeyScancode { .. } => 2 /* scancode */ + 1 /* pressed */,
                 Self::KeyUnicode { .. } => 4 /* ch */ + 1 /* pressed */,
+                Self::KeyBatch { events } => {
+                    1 /* event_count */
+                        + events.iter().map(|event| match event {
+                            KeyInput::Scancode { .. } => 1 /* kind */ + 2 /* scancode */ + 1 /* pressed */,
+                            KeyInput::Unicode { .. } => 1 /* kind */ + 4 /* ch */ + 1 /* pressed */,
+                        }).sum::<usize>()
+                }
                 Self::Touch { frames, .. } => {
                     4 /* encode_time */ + 2 /* frame_count */
                         + frames.iter().map(|frame| {
@@ -2314,6 +2681,14 @@ impl Encode for Request {
                             .sum::<usize>()
                 }
                 Self::DismissHoveringTouchContact { .. } => 1 /* contact_id */,
+                Self::ClipboardSet { text } => string_size(text),
+                Self::ClipboardSetImage { png } => bytes_size(png),
+                Self::ClipboardSetHtml { html } => string_size(html),
+                Self::ClipboardSetFiles { paths } => {
+                    2 /* path_count */ + paths.iter().map(|path| string_size(path)).sum::<usize>()
+                }
+                Self::ClipboardListFiles => 0,
+                Self::ClipboardGetFile { .. } => 4 /* index */,
             }
     }
 }
@@ -2332,13 +2707,17 @@ impl Decode<'_> for Request {
                 })
             }
             1 => Ok(Self::Disconnect),
+            39 => Ok(Self::DisconnectMatching {
+                server: read_string(src)?,
+            }),
+            38 => Ok(Self::DaemonStop),
             2 => Ok(Self::Status),
             3 => {
                 ensure_size!(in: src, size: 1);
                 let filter = match src.read_u8() {
                     0 => None,
                     1 => Some(KeyFilter::decode(src)?),
-                    _ => return Err(ironrdp_core::invalid_field_err!("dump filter", "invalid presence flag")),
+                    _ => return Err(ironrdp_core::invalid_field_err!("dump filter", "invalid presence flag", in: src)),
                 };
                 Ok(Self::QueryProps { filter })
             }
@@ -2351,7 +2730,7 @@ impl Decode<'_> for Request {
                         ensure_size!(in: src, size: 4);
                         Some(src.read_u32())
                     }
-                    _ => return Err(ironrdp_core::invalid_field_err!("query last", "invalid presence flag")),
+                    _ => return Err(ironrdp_core::invalid_field_err!("query last", "invalid presence flag", in: src)),
                 };
                 Ok(Self::QueryLogs { substring, last })
             }
@@ -2383,6 +2762,33 @@ impl Decode<'_> for Request {
                 let ch = read_char(src)?;
                 let pressed = read_bool(src)?;
                 Ok(Self::KeyUnicode { ch, pressed })
+            }
+            40 => {
+                ensure_size!(in: src, size: 1);
+                let count = usize::from(src.read_u8());
+                if count == 0 || count > MAX_KEY_BATCH_EVENTS {
+                    return Err(ironrdp_core::invalid_field_err!("key batch", "invalid event count", in: src));
+                }
+                let mut events = Vec::with_capacity(count);
+                for _ in 0..count {
+                    ensure_size!(in: src, size: 1);
+                    let event = match src.read_u8() {
+                        0 => {
+                            ensure_size!(in: src, size: 2);
+                            let scancode = src.read_u16();
+                            let pressed = read_bool(src)?;
+                            KeyInput::Scancode { scancode, pressed }
+                        }
+                        1 => {
+                            let ch = read_char(src)?;
+                            let pressed = read_bool(src)?;
+                            KeyInput::Unicode { ch, pressed }
+                        }
+                        _ => return Err(ironrdp_core::invalid_field_err!("key batch", "invalid event kind", in: src)),
+                    };
+                    events.push(event);
+                }
+                Ok(Self::KeyBatch { events })
             }
             21 => Ok(Self::UnicodeText {
                 text: read_string(src)?,
@@ -2504,7 +2910,47 @@ impl Decode<'_> for Request {
                     timeout_ms: src.read_u32(),
                 })
             }
-            _ => Err(ironrdp_core::invalid_field_err!("request", "unknown tag")),
+            29 => Ok(Self::ClipboardGet),
+            30 => Ok(Self::ClipboardSet {
+                text: read_string(src)?,
+            }),
+            31 => Ok(Self::ClipboardGetImage),
+            32 => {
+                let png = read_bytes(src)?;
+                if png.len() > MAX_CLIPBOARD_IMAGE_BYTES {
+                    return Err(ironrdp_core::invalid_field_err!("clipboard image", "too large"));
+                }
+                Ok(Self::ClipboardSetImage { png })
+            }
+            33 => Ok(Self::ClipboardGetHtml),
+            34 => {
+                let html = read_string(src)?;
+                if html.len() > MAX_CLIPBOARD_HTML_BYTES {
+                    return Err(ironrdp_core::invalid_field_err!("clipboard html", "too large", in: src));
+                }
+                Ok(Self::ClipboardSetHtml { html })
+            }
+            35 => {
+                ensure_size!(in: src, size: 2);
+                let path_count = usize::from(src.read_u16());
+                if path_count > MAX_CLIPBOARD_FILE_LIST_ENTRIES {
+                    return Err(ironrdp_core::invalid_field_err!(
+                        "clipboard file paths",
+                        "too many paths"
+                    ));
+                }
+                let mut paths = Vec::with_capacity(path_count);
+                for _ in 0..path_count {
+                    paths.push(read_string(src)?);
+                }
+                Ok(Self::ClipboardSetFiles { paths })
+            }
+            36 => Ok(Self::ClipboardListFiles),
+            37 => {
+                ensure_size!(in: src, size: 4);
+                Ok(Self::ClipboardGetFile { index: src.read_i32() })
+            }
+            _ => Err(ironrdp_core::invalid_field_err!("request", "unknown tag", in: src)),
         }
     }
 }
@@ -2533,7 +2979,7 @@ fn read_error_category(src: &mut ReadCursor<'_>) -> DecodeResult<AgentErrorCateg
         3 => Ok(AgentErrorCategory::Transport),
         4 => Ok(AgentErrorCategory::Remote),
         5 => Ok(AgentErrorCategory::Internal),
-        _ => Err(ironrdp_core::invalid_field_err!("agent error category", "unknown tag")),
+        _ => Err(ironrdp_core::invalid_field_err!("agent error category", "unknown tag", in: src)),
     }
 }
 
@@ -2580,7 +3026,7 @@ fn read_execution_kind(src: &mut ReadCursor<'_>) -> DecodeResult<NowExecutionKin
         1 => Ok(NowExecutionKind::Batch),
         2 => Ok(NowExecutionKind::PowerShell),
         3 => Ok(NowExecutionKind::Pwsh),
-        _ => Err(ironrdp_core::invalid_field_err!("NOW execution kind", "unknown tag")),
+        _ => Err(ironrdp_core::invalid_field_err!("NOW execution kind", "unknown tag", in: src)),
     }
 }
 
@@ -2632,7 +3078,7 @@ impl Decode<'_> for NowExecutionRequest {
         let stdin = match src.read_u8() {
             0 => None,
             1 => Some(read_bytes(src)?),
-            _ => return Err(ironrdp_core::invalid_field_err!("NOW stdin", "invalid presence flag")),
+            _ => return Err(ironrdp_core::invalid_field_err!("NOW stdin", "invalid presence flag", in: src)),
         };
         Ok(Self {
             kind,
@@ -2670,7 +3116,7 @@ fn read_operation_state(src: &mut ReadCursor<'_>) -> DecodeResult<OperationState
         3 => Ok(OperationState::Cancelled),
         4 => Ok(OperationState::Failed),
         5 => Ok(OperationState::Detached),
-        _ => Err(ironrdp_core::invalid_field_err!("operation state", "unknown tag")),
+        _ => Err(ironrdp_core::invalid_field_err!("operation state", "unknown tag", in: src)),
     }
 }
 
@@ -2732,7 +3178,7 @@ impl Decode<'_> for OperationInfo {
                 ensure_size!(in: src, size: 4);
                 Some(src.read_u32())
             }
-            _ => return Err(ironrdp_core::invalid_field_err!("exit code", "invalid presence flag")),
+            _ => return Err(ironrdp_core::invalid_field_err!("exit code", "invalid presence flag", in: src)),
         };
         ensure_size!(in: src, size: 1);
         let error = match src.read_u8() {
@@ -2741,7 +3187,8 @@ impl Decode<'_> for OperationInfo {
             _ => {
                 return Err(ironrdp_core::invalid_field_err!(
                     "operation error",
-                    "invalid presence flag"
+                    "invalid presence flag",
+                    in: src
                 ));
             }
         };
@@ -2773,7 +3220,7 @@ fn read_stream(src: &mut ReadCursor<'_>) -> DecodeResult<NowStream> {
     match src.read_u8() {
         0 => Ok(NowStream::Stdout),
         1 => Ok(NowStream::Stderr),
-        _ => Err(ironrdp_core::invalid_field_err!("NOW output stream", "unknown tag")),
+        _ => Err(ironrdp_core::invalid_field_err!("NOW output stream", "unknown tag", in: src)),
     }
 }
 
@@ -2836,7 +3283,7 @@ impl Decode<'_> for OperationEventKind {
             }
             4 => Ok(Self::Cancelled),
             5 => Ok(Self::Failed(AgentError::decode(src)?)),
-            _ => Err(ironrdp_core::invalid_field_err!("operation event", "unknown tag")),
+            _ => Err(ironrdp_core::invalid_field_err!("operation event", "unknown tag", in: src)),
         }
     }
 }
@@ -2877,7 +3324,88 @@ impl_pdu_pod!(OperationEvent);
 mod tests {
     use ironrdp_core::{decode, encode_vec};
 
-    use super::{MAX_RAIL_EVENT_DUMP_EVENTS, RailEvent, RailEventDump, RailEventKind, RailExecuteRequest};
+    use super::{
+        KeyInput, MAX_KEY_BATCH_EVENTS, MAX_RAIL_EVENT_DUMP_EVENTS, RailEvent, RailEventDump, RailEventKind,
+        RailExecuteRequest, Request,
+    };
+
+    #[test]
+    fn daemon_stop_has_a_distinct_request_tag() {
+        let encoded = encode_vec(&Request::DaemonStop).expect("encode");
+        assert_eq!(encoded, [38]);
+        assert_eq!(decode::<Request>(&encoded).expect("decode"), Request::DaemonStop);
+    }
+
+    #[test]
+    fn guarded_disconnect_round_trips_with_a_new_request_tag() {
+        let request = Request::DisconnectMatching {
+            server: "IT-HELP-RDM:3389".to_owned(),
+        };
+        let encoded = encode_vec(&request).expect("encode");
+        assert_eq!(encoded[0], 39);
+        assert_eq!(decode::<Request>(&encoded).expect("decode"), request);
+    }
+
+    #[test]
+    fn key_batch_round_trips_and_rejects_invalid_counts() {
+        let request = Request::KeyBatch {
+            events: vec![
+                KeyInput::Scancode {
+                    scancode: 0x1D,
+                    pressed: true,
+                },
+                KeyInput::Unicode { ch: 'x', pressed: true },
+                KeyInput::Unicode {
+                    ch: 'x',
+                    pressed: false,
+                },
+                KeyInput::Scancode {
+                    scancode: 0x1D,
+                    pressed: false,
+                },
+            ],
+        };
+        let encoded = encode_vec(&request).expect("encode key sequence");
+        assert_eq!(encoded[0], 40);
+        assert_eq!(decode::<Request>(&encoded).expect("decode key sequence"), request);
+        assert!(encode_vec(&Request::KeyBatch { events: Vec::new() }).is_err());
+        assert!(
+            encode_vec(&Request::KeyBatch {
+                events: vec![KeyInput::Unicode { ch: 'a', pressed: true }; MAX_KEY_BATCH_EVENTS + 1],
+            })
+            .is_err()
+        );
+        assert!(decode::<Request>(&[40, 0]).is_err());
+        assert!(decode::<Request>(&[40, u8::try_from(MAX_KEY_BATCH_EVENTS + 1).unwrap()]).is_err());
+        assert!(decode::<Request>(&[40, 1, 2]).is_err());
+        assert!(decode::<Request>(&[40, 1, 0, 0x1D]).is_err());
+    }
+
+    #[test]
+    fn status_decodes_legacy_reply_without_certificate_presence() {
+        let status = super::StatusInfo {
+            state: super::ConnState::NoSession,
+            destination: None,
+            width: None,
+            height: None,
+            message: None,
+            credentials_loaded: false,
+            untrusted_certificate: None,
+        };
+        let mut legacy = encode_vec(&status).expect("encode status");
+        assert_eq!(legacy.pop(), Some(0));
+        assert_eq!(
+            decode::<super::StatusInfo>(&legacy).expect("decode legacy status"),
+            status
+        );
+        assert_eq!(
+            ironrdp_core::decode_owned::<super::StatusInfo>(&legacy).expect("decode owned"),
+            status
+        );
+
+        legacy.push(1);
+        assert!(decode::<super::StatusInfo>(&legacy).is_err());
+    }
 
     #[test]
     fn rail_execute_debug_redacts_command_fields() {
@@ -3016,7 +3544,8 @@ impl Decode<'_> for NowDiagnostics {
             _ => {
                 return Err(ironrdp_core::invalid_field_err!(
                     "NOW capabilities",
-                    "invalid presence flag"
+                    "invalid presence flag",
+                    in: src
                 ));
             }
         };
