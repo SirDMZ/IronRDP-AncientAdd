@@ -218,7 +218,15 @@ impl GatewayHttpAuth {
         let config = NegotiateConfig {
             protocol_config: Box::new(NtlmConfig::new(client_computer_name.clone())),
             // Prefer Kerberos when available; keep NTLM fallback; skip PKU2U for gateway HTTP.
-            package_list: Some("kerberos,ntlm".to_owned()),
+            // Without the `kerberos` feature no KDC is reachable, so offer NTLM alone.
+            package_list: Some(
+                if cfg!(feature = "kerberos") {
+                    "kerberos,ntlm"
+                } else {
+                    "ntlm"
+                }
+                .to_owned(),
+            ),
             client_computer_name,
         };
 
@@ -474,9 +482,12 @@ impl GatewayHttpAuth {
                     .map_err(|e| Error::custom("negotiate initialize security context", e))?;
 
                 // Kerberos may suspend for KDC traffic; NTLM completes without network.
-                let InitializeSecurityContextResult { status, .. } = generator
-                    .resolve_with_default_network_client()
-                    .map_err(|e| Error::custom("negotiate initialize security context", e))?;
+                #[cfg(feature = "kerberos")]
+                let result = generator.resolve_with_default_network_client();
+                #[cfg(not(feature = "kerberos"))]
+                let result = generator.resolve_with_client(&NoNetworkClient);
+                let InitializeSecurityContextResult { status, .. } =
+                    result.map_err(|e| Error::custom("negotiate initialize security context", e))?;
                 status
             }
         };
@@ -602,4 +613,18 @@ pub(crate) fn www_authenticate_values(headers: &hyper::HeaderMap) -> Vec<&str> {
         .iter()
         .filter_map(|v| v.to_str().ok())
         .collect()
+}
+
+/// Refuses KDC traffic, so Kerberos fails while NTLM, which needs no network, still completes.
+#[cfg(not(feature = "kerberos"))]
+struct NoNetworkClient;
+
+#[cfg(not(feature = "kerberos"))]
+impl sspi::network_client::NetworkClient for NoNetworkClient {
+    fn send(&self, _request: &sspi::NetworkRequest) -> sspi::Result<Vec<u8>> {
+        Err(sspi::Error::new(
+            sspi::ErrorKind::NoAuthenticatingAuthority,
+            "Kerberos needs the `kerberos` feature",
+        ))
+    }
 }
