@@ -1,14 +1,14 @@
-//! TLS to the gateway: accept any server certificate at the TLS layer, then decide
-//! trust at the application layer. RD Gateways are commonly self-signed, so trust is
-//! established by trust-on-first-use (TOFU) pinning of the certificate fingerprint
-//! rather than by a CA. The actual TLS handshake is delegated to `ironrdp-tls`.
+//! TLS to the gateway: accept any server certificate at the TLS layer, then let the
+//! caller decide trust from its fingerprint. RD Gateways are commonly self-signed, so
+//! a caller can pin the fingerprint on first use (TOFU) rather than rely on a CA.
+//! This crate stores no fingerprints itself. The TLS handshake is delegated to `ironrdp-tls`.
 
 use sha2::{Digest as _, Sha256};
 use tokio::net::TcpStream;
 
 use crate::error::{GatewayError, GatewayResult};
 
-/// A pinned view of a gateway's TLS certificate, for trust-on-first-use.
+/// A gateway's TLS certificate, identified by its fingerprint for the caller's trust decision.
 #[derive(Debug, Clone)]
 pub struct CertInfo {
     /// The gateway host this certificate was presented for (the TOFU key).

@@ -166,12 +166,12 @@ pub struct Channel {
     stream: BufReader<TlsStream<TcpStream>>,
     host: String,
     uri: String,
-    /// The gateway's pinned certificate (captured at connect).
+    /// The gateway's certificate, captured at connect.
     cert: CertInfo,
 }
 
 impl Channel {
-    /// The gateway's pinned TLS certificate, captured at connect.
+    /// The gateway's TLS certificate, captured at connect.
     pub fn cert(&self) -> &CertInfo {
         &self.cert
     }

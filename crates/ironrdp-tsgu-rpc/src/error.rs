@@ -12,7 +12,7 @@ pub enum GatewayError {
     /// TLS handshake or certificate parsing failed.
     #[error("tls: {0}")]
     Tls(String),
-    /// The gateway's TLS certificate was rejected (trust-on-first-use).
+    /// The caller rejected the gateway's TLS certificate.
     #[error("gateway certificate rejected: {0}")]
     CertRejected(String),
     /// A gateway/RPC protocol step failed (HTTP, RTS, DCE/RPC bind, NDR, or sspi).

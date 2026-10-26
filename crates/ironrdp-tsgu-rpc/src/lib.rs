@@ -116,7 +116,7 @@ fn rpc_uri() -> String {
 /// Result of the Layer-1 auth probe.
 #[derive(Debug)]
 pub struct AuthProbe {
-    /// The gateway's pinned TLS certificate.
+    /// The gateway's TLS certificate.
     pub cert: CertInfo,
     /// HTTP status after the Type-3 token (200 => NTLM accepted).
     pub status: u16,
@@ -155,7 +155,7 @@ pub async fn probe_auth(params: &GatewayParams) -> Result<AuthProbe, GatewayErro
 /// Result of the Layer-2 RTS handshake probe.
 #[derive(Debug)]
 pub struct RtsProbe {
-    /// The gateway's pinned TLS certificate.
+    /// The gateway's TLS certificate.
     pub cert: CertInfo,
     /// The server's ConnectionTimeout from CONN/C2 (ms).
     pub connection_timeout: u32,
@@ -165,7 +165,7 @@ pub struct RtsProbe {
 
 /// Open both RPC channels, HTTP-authenticate each with NTLM, and run the RTS
 /// handshake - the shared Layer-1+2 setup behind every higher probe. Returns the
-/// pinned gateway cert and the OPENED virtual connection.
+/// OUT channel's gateway certificate and the OPENED virtual connection.
 async fn open_gateway_connection(
     params: &GatewayParams,
     verify: &mut dyn FnMut(&CertInfo) -> TofuDecision,
@@ -175,13 +175,14 @@ async fn open_gateway_connection(
     let in_channel = Channel::connect(&params.host, params.port, rpc_uri()).await?;
     let cert = out_channel.cert().clone();
 
-    // Verify the gateway's own TLS cert BEFORE any credential is sent: a CA-signed
-    // cert is trusted silently, otherwise it's a TOFU decision. NTLM below carries
-    // the user's gateway/AD password, so a rejected or unknown gateway cert must
-    // abort here - ahead of open_virtual_connection, which authenticates.
-    match verify(&cert) {
-        TofuDecision::Pin => {}
-        TofuDecision::Abort => return Err(GatewayError::CertRejected(cert.fingerprint())),
+    // The caller decides trust before any credential is sent, because NTLM below authenticates with the gateway account's password.
+    // The channels are separate TLS connections, which a gateway farm can serve from different servers, so a differing IN certificate needs its own decision.
+    let in_cert = (in_channel.cert().sha256_hex != cert.sha256_hex).then(|| in_channel.cert().clone());
+    for presented in core::iter::once(&cert).chain(in_cert.as_ref()) {
+        match verify(presented) {
+            TofuDecision::Pin => {}
+            TofuDecision::Abort => return Err(GatewayError::CertRejected(presented.fingerprint())),
+        }
     }
 
     // Each HTTP request authenticates separately, so each channel gets its own
@@ -215,7 +216,7 @@ pub async fn probe_rts(params: &GatewayParams) -> Result<RtsProbe, GatewayError>
 /// Result of the Layer-3 secure-bind probe.
 #[derive(Debug)]
 pub struct BindProbe {
-    /// The gateway's pinned TLS certificate.
+    /// The gateway's TLS certificate.
     pub cert: CertInfo,
     /// CONN/C2 ConnectionTimeout carried through from Layer 2 (ms).
     pub connection_timeout: u32,
@@ -255,7 +256,7 @@ pub async fn probe_bind(params: &GatewayParams) -> Result<BindProbe, GatewayErro
 /// Result of the Layer-4a `TsProxyCreateTunnel` probe.
 #[derive(Debug)]
 pub struct TunnelProbe {
-    /// The gateway's pinned TLS certificate.
+    /// The gateway's TLS certificate.
     pub cert: CertInfo,
     /// The tunnel id returned by `TsProxyCreateTunnel`.
     pub tunnel_id: u32,
@@ -287,7 +288,7 @@ pub async fn probe_tunnel(params: &GatewayParams) -> Result<TunnelProbe, Gateway
 /// Result of the Layer-4b `TsProxyCreateChannel` probe.
 #[derive(Debug)]
 pub struct ChannelProbe {
-    /// The gateway's pinned TLS certificate.
+    /// The gateway's TLS certificate.
     pub cert: CertInfo,
     /// The tunnel id from `TsProxyCreateTunnel`.
     pub tunnel_id: u32,
@@ -334,7 +335,7 @@ const X224_CONNECTION_REQUEST: &[u8] = &[
 /// Result of the Layer-4c data-pipe probe.
 #[derive(Debug)]
 pub struct PipeProbe {
-    /// The gateway's pinned TLS certificate.
+    /// The gateway's TLS certificate.
     pub cert: CertInfo,
     /// The channel id from `TsProxyCreateChannel`.
     pub channel_id: u32,
@@ -371,12 +372,12 @@ pub async fn probe_pipe(params: &GatewayParams) -> Result<PipeProbe, GatewayErro
 /// end-to-end (auth + RTS + bind + CreateTunnel + AuthorizeTunnel + CreateChannel +
 /// SetupReceivePipe). This is the primary entry point.
 ///
-/// Returns the pinned gateway certificate and the live [`GatewayTunnel`], whose
+/// Returns the OUT channel's gateway certificate and the live [`GatewayTunnel`], whose
 /// [`GatewayTunnel::into_async`] yields an `AsyncRead + AsyncWrite` transport
 /// ([`RdpTunnel`]) to run the RDP handshake over (e.g. with `ironrdp-connector`).
 ///
-/// `verify` is called with the gateway's own TLS certificate before any credential
-/// is sent; return [`TofuDecision::Abort`] to reject an untrusted gateway.
+/// `verify` is called before any credential is sent, once for the OUT channel's certificate and again for the IN channel's when it differs.
+/// Return [`TofuDecision::Abort`] to reject an untrusted gateway.
 pub async fn open_tunnel(
     params: &GatewayParams,
     verify: &mut dyn FnMut(&CertInfo) -> TofuDecision,
