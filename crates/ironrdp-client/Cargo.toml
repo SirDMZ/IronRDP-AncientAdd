@@ -41,13 +41,14 @@ native-tls = [
     "ironrdp-tsgu-rpc?/native-tls",
 ]
 
-# Audio redirection. PCM-only via cpal (WASAPI/CoreAudio/ALSA) — no bundled libopus,
-# so no CMake/NASM is needed to build it. Opus decode/encode is a separate opt-in
-# (`sound-opus`) for callers that have a C toolchain and want the bandwidth saving.
+# Audio redirection through cpal (WASAPI/CoreAudio/ALSA), with PCM everywhere and AAC through
+# Media Foundation on Windows. Neither needs a C toolchain to build. Opus decode/encode is a
+# separate opt-in (`sound-opus`) for callers that have a C toolchain and want the bandwidth saving.
 sound = [
     "dep:ironrdp-rdpsnd",
     "dep:ironrdp-rdpsnd-native",
     "ironrdp-rdpsnd-native/capture",
+    "ironrdp-rdpsnd-native/aac",
     "dep:ironrdp-rdpeai",
 ]
 # Add Opus to the audio path (server->client decode and mic encode). Pulls a bundled
@@ -138,7 +139,7 @@ ironrdp-rdpeusb = { path = "../ironrdp-rdpeusb", version = "0.1", optional = tru
 
 # Optional backend crates (activated by features above)
 # `default-features = false` drops the default `opus` feature, whose bundled libopus needs CMake.
-# Audio stays PCM-only unless `sound-opus` turns Opus back on.
+# Audio stays PCM, plus AAC through Media Foundation on Windows, unless `sound-opus` turns Opus back on.
 ironrdp-rdpsnd-native = { path = "../ironrdp-rdpsnd-native", version = "0.7", optional = true, default-features = false } # public
 ironrdp-cliprdr-native = { path = "../ironrdp-cliprdr-native", version = "0.8", optional = true }
 ironrdp-mstsgu = { path = "../ironrdp-mstsgu", version = "0.0.2", optional = true }
