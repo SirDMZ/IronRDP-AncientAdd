@@ -7,7 +7,8 @@ use std::sync::Arc;
 use ironrdp_cfg::GatewayCredentialsSource;
 use ironrdp_cfg::PropertySetExt as _;
 use ironrdp_client::config::{
-    AudioQualityMode, ClipboardType, ConfigBuilder, Destination, DriveRedirection, Transport, UdpVersion, VmConnectMode,
+    AudioQualityMode, ClipboardType, ConfigBuilder, Destination, DriveRedirection, RpchEngine, Transport, UdpVersion,
+    VmConnectMode,
 };
 #[cfg(windows)]
 use ironrdp_client::config::{MissingField, TransportKind};
@@ -112,6 +113,74 @@ fn gateway_detect_prefers_direct_when_hostname_is_set() {
     };
     assert_eq!(gw.endpoint, "gw.example.com:443");
     assert!(gw.prefer_direct);
+}
+
+#[test]
+fn gw_rpc_selects_rpch_with_the_tsgu_rpc_engine_by_default() {
+    let config = parse_config_from_rdp(
+        "full address:s:rdp.example.com\nusername:s:test-user\nClearTextPassword:s:test-pass\n",
+        &[
+            "--gw-endpoint",
+            "gw.example.com:443",
+            "--gw-user",
+            "gw-user",
+            "--gw-pass",
+            "gw-pass",
+            "--gw-domain",
+            "CORP",
+            "--gw-rpc",
+        ],
+    );
+
+    let Transport::GatewayRpch(gw) = config.transport() else {
+        panic!("RPC-over-HTTP gateway should be configured");
+    };
+    assert_eq!(gw.endpoint, "gw.example.com:443");
+    assert_eq!(gw.username, "gw-user");
+    assert_eq!(gw.domain.as_deref(), Some("CORP"));
+    assert_eq!(gw.rpch_engine, RpchEngine::TsguRpc);
+}
+
+#[test]
+fn gw_rpc_engine_selects_the_mstsgu_implementation() {
+    let config = parse_config_from_rdp(
+        "full address:s:rdp.example.com\nusername:s:test-user\nClearTextPassword:s:test-pass\n",
+        &[
+            "--gw-endpoint",
+            "gw.example.com:443",
+            "--gw-user",
+            "gw-user",
+            "--gw-pass",
+            "gw-pass",
+            "--gw-rpc",
+            "--gw-rpc-engine",
+            "mstsgu",
+        ],
+    );
+
+    let Transport::GatewayRpch(gw) = config.transport() else {
+        panic!("RPC-over-HTTP gateway should be configured");
+    };
+    assert_eq!(gw.rpch_engine, RpchEngine::Mstsgu);
+}
+
+#[test]
+fn gw_rpc_engine_requires_gw_rpc() {
+    let result = parse_config_from_rdp_result(
+        "full address:s:rdp.example.com\nusername:s:test-user\nClearTextPassword:s:test-pass\n",
+        &[
+            "--gw-endpoint",
+            "gw.example.com:443",
+            "--gw-user",
+            "gw-user",
+            "--gw-pass",
+            "gw-pass",
+            "--gw-rpc-engine",
+            "mstsgu",
+        ],
+    );
+
+    assert!(result.is_err());
 }
 
 #[test]

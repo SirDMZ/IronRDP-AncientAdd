@@ -8,7 +8,7 @@ use clap::Parser;
 use clap::clap_derive::ValueEnum;
 use ironrdp::client::config::{
     ClipboardType as ResolvedClipboardType, Config, ConfigBuilder, Destination, DriveRedirection, DvcProxyInfo,
-    MissingField, TransportKind, VmConnectMode,
+    MissingField, RpchEngine, TransportKind, VmConnectMode,
 };
 use ironrdp::client::usb::UsbRedirectionConfig;
 use ironrdp::pdu::rdp::capability_sets::{MajorPlatformType, client_codecs_capabilities};
@@ -27,6 +27,17 @@ pub enum ClipboardType {
     Disable,
     /// Use a stub clipboard backend (for testing or headless usage).
     Stub,
+}
+
+/// CLI selection for the implementation of the RPC-over-HTTP gateway transport.
+///
+/// Maps directly into the library's [`RpchEngine`].
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
+pub enum GatewayRpcEngine {
+    /// `ironrdp-tsgu-rpc` (default): mirrors FreeRDP's requests, without channel recycling or reauthentication.
+    TsguRpc,
+    /// `ironrdp-mstsgu`: recycles channels, answers reauthentication, and also authenticates with Negotiate and Basic.
+    Mstsgu,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
@@ -84,6 +95,9 @@ struct Args {
     /// Use the RPC-over-HTTP gateway transport (MS-TSGU over MS-RPCH) instead of the WebSocket one.
     #[clap(long = "gw-rpc", requires = "gw_endpoint")]
     gw_rpc: bool,
+    /// Implementation of the RPC-over-HTTP gateway transport [default: tsgu-rpc].
+    #[clap(long = "gw-rpc-engine", value_enum, requires = "gw_rpc")]
+    gw_rpc_engine: Option<GatewayRpcEngine>,
 
     /// An address on which the client will connect.
     #[clap(env = "RDP_HOSTNAME")]
@@ -988,6 +1002,12 @@ fn apply_cli_to_builder(
         }
         if let Some(gw_domain) = args.gw_domain {
             builder = builder.with_gateway_domain(gw_domain);
+        }
+        if let Some(engine) = args.gw_rpc_engine {
+            builder = builder.with_gateway_rpch_engine(match engine {
+                GatewayRpcEngine::TsguRpc => RpchEngine::TsguRpc,
+                GatewayRpcEngine::Mstsgu => RpchEngine::Mstsgu,
+            });
         }
     }
 
