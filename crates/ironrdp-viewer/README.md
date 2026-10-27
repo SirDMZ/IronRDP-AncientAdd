@@ -76,6 +76,8 @@ The gateway transport is WebSocket by default, and `--gw-rpc` selects RPC over H
 To build without a C toolchain (no CMake, NASM, or C compiler), use `--no-default-features --features rustls-rustcrypto,sound`.
 That build leaves out Opus, RDP-UDP, and Kerberos for gateway authentication.
 
+A server that offers CredSSP version 2, 3 or 4, which CVE-2018-0886 affects, is refused; `--allow-insecure-credssp` accepts it, for a server that cannot be updated.
+
 ## Agent RPC host
 
 The viewer can host the same local RPC protocol used by `ironrdp-agent`, while keeping its visible

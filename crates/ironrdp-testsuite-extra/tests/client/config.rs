@@ -183,6 +183,15 @@ fn gw_rpc_engine_requires_gw_rpc() {
     assert!(result.is_err());
 }
 
+// oracle: reference mstsc (its default Encryption Oracle Remediation policy refuses the vulnerable CredSSP versions)
+#[test]
+fn insecure_credssp_is_refused_unless_the_cli_opts_in() {
+    let rdp = "full address:s:rdp.example.com\nusername:s:test-user\nClearTextPassword:s:test-pass\n";
+
+    assert!(!parse_config_from_rdp(rdp, &[]).allows_insecure_credssp());
+    assert!(parse_config_from_rdp(rdp, &["--allow-insecure-credssp"]).allows_insecure_credssp());
+}
+
 #[test]
 fn no_credssp_cli_flag_overrides_rdp_enable_credssp_property() {
     let config = parse_config_from_rdp(

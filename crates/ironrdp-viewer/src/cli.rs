@@ -227,6 +227,13 @@ struct Args {
     #[clap(long, alias = "no-nla")]
     no_credssp: bool,
 
+    /// Accept a server that offers CredSSP version 2, 3 or 4
+    ///
+    /// Those versions bind the server's public key with the scheme CVE-2018-0886 exploited, so they are refused by default.
+    /// Use this only for a server that cannot be updated, on a network you trust.
+    #[clap(long, conflicts_with = "no_credssp")]
+    allow_insecure_credssp: bool,
+
     /// The clipboard type
     #[clap(long, value_enum, default_value_t = ClipboardType::Enable)]
     clipboard_type: ClipboardType,
@@ -941,6 +948,9 @@ fn apply_cli_to_builder(
     }
     if args.no_credssp {
         builder = builder.with_credssp(false);
+    }
+    if args.allow_insecure_credssp {
+        builder = builder.with_insecure_credssp(true);
     }
     if args.no_tls {
         builder = builder.with_tls(false);

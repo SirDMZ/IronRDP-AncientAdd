@@ -2476,8 +2476,9 @@ fn build_connector(
         None
     };
 
-    let mut connector =
-        ironrdp_connector::ClientConnector::new(connector_config, client_addr).with_static_channel(drdynvc);
+    let mut connector = ironrdp_connector::ClientConnector::new(connector_config, client_addr)
+        .with_static_channel(drdynvc)
+        .with_insecure_credssp(config.allows_insecure_credssp());
 
     if let Some(load_balance_info) = &config.load_balance_info {
         connector = connector.with_load_balance_info(load_balance_info.clone());

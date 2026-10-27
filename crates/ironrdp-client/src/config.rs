@@ -103,6 +103,7 @@ pub struct Config {
     pub(crate) udp_offer_version: UdpVersion,
     pub(crate) certificate_validation: ironrdp_tls::CertificateValidation,
     pub(crate) certificate_validation_callback: Option<ironrdp_tls::CertificateValidationCallback>,
+    pub(crate) allow_insecure_credssp: bool,
 
     #[cfg(feature = "vmconnect")]
     /// Hyper-V VM ID when connecting to a VM console (port [`ironrdp_vmconnect::PORT`]).
@@ -187,6 +188,11 @@ impl Config {
     /// TLS peer-certificate validation policy.
     pub fn certificate_validation(&self) -> ironrdp_tls::CertificateValidation {
         self.certificate_validation
+    }
+
+    /// Whether a server offering a CredSSP version below 5 is accepted.
+    pub fn allows_insecure_credssp(&self) -> bool {
+        self.allow_insecure_credssp
     }
 
     /// Optional exception handler for an otherwise-invalid server certificate.
@@ -890,6 +896,7 @@ pub struct ConfigBuilder {
     enable_tls: Option<bool>,
     enable_credssp: Option<bool>,
     certificate_validation: Option<ironrdp_tls::CertificateValidation>,
+    allow_insecure_credssp: bool,
     certificate_validation_callback: Option<ironrdp_tls::CertificateValidationCallback>,
     keyboard_type: Option<ironrdp_pdu::gcc::KeyboardType>,
     keyboard_subtype: Option<u32>,
@@ -1367,6 +1374,16 @@ impl ConfigBuilder {
     #[must_use]
     pub fn with_certificate_validation(mut self, validation: ironrdp_tls::CertificateValidation) -> Self {
         self.certificate_validation = Some(validation);
+        self
+    }
+
+    /// Accept a server that offers a CredSSP version below 5.
+    ///
+    /// Off by default, because those versions bind the server's public key with the scheme CVE-2018-0886 exploited.
+    /// See [`ironrdp_connector::ClientConnector::with_insecure_credssp`].
+    #[must_use]
+    pub fn with_insecure_credssp(mut self, allow: bool) -> Self {
+        self.allow_insecure_credssp = allow;
         self
     }
 
@@ -2466,6 +2483,7 @@ impl ConfigBuilder {
             udp_offer_version: self.udp_offer_version.unwrap_or(UdpVersion::V3),
             certificate_validation,
             certificate_validation_callback: self.certificate_validation_callback,
+            allow_insecure_credssp: self.allow_insecure_credssp,
             #[cfg(feature = "vmconnect")]
             vm_id: self.vm_id,
             #[cfg(feature = "vmconnect")]
