@@ -553,6 +553,23 @@ impl GraphicsPipelineClient {
         self
     }
 
+    /// Turn the client's surface compositor on or off; on by default.
+    ///
+    /// The compositor keeps a copy of every surface and the bitmap cache, and its output is what
+    /// [`Self::drain_output`], [`Self::drain_window_updates`] and [`Self::take_output_reset`] return.
+    /// An application that renders from the [`GraphicsPipelineHandler`] callbacks can turn it off:
+    /// those callbacks, surface tracking, cache import and eviction handling and frame
+    /// acknowledgements are unchanged, while the compositor allocates and copies no pixels and
+    /// the three methods above return nothing.
+    /// Without it the client holds no bitmaps to offer, so [`Self::with_persistent_cache`] offers
+    /// and saves nothing, and the store keeps the entries it had.
+    /// Call it before the channel opens.
+    #[must_use]
+    pub fn with_compositing(mut self, enabled: bool) -> Self {
+        self.compositor.set_enabled(enabled);
+        self
+    }
+
     /// Set how decoded frames are acknowledged; [`FrameAckMode::PerFrame`] by default.
     #[must_use]
     pub fn with_frame_ack_mode(mut self, mode: FrameAckMode) -> Self {
@@ -944,7 +961,8 @@ impl GraphicsPipelineClient {
         // The compositor reset below recomputes its budget without them.
         self.avc444_frames.clear();
         self.compositor.reset(width, height);
-        self.pending_output_reset = output_size;
+        // Without compositing nothing is drawn into the output, so it has nothing to resize either.
+        self.pending_output_reset = output_size.filter(|_| self.compositor.is_enabled());
 
         // Reset frame tracking state so subsequent FrameAcknowledge PDUs
         // don't report stale queue depth from a previous stream.
@@ -1435,7 +1453,7 @@ impl GraphicsPipelineClient {
 
         // The combined picture lives as long as the surface, so it is charged to the
         // compositor's budget, and only for a surface the compositor accepted, whose
-        // dimensions it has bounded.
+        // dimensions it has bounded; without compositing the budget alone bounds it.
         let frame = match self.avc444_frames.entry(surface_id) {
             Entry::Occupied(entry) => entry.into_mut(),
             Entry::Vacant(entry) => {
@@ -1753,12 +1771,16 @@ impl GraphicsPipelineClient {
     }
 
     /// Build the `CacheImportOffer` sent right after `CapabilitiesConfirm` ([MS-RDPEGFX] [3.3.5.16]),
-    /// or `None` without a persistent cache, a confirmed capability set, or stored entries.
+    /// or `None` without a persistent cache, compositing, a confirmed capability set, or stored entries.
     ///
     /// [MS-RDPEGFX]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/da5c75f9-cd99-450c-98c4-014a496942b0
     /// [3.3.5.16]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/adf5cc51-d0b1-4533-987f-16296bbe6966
     #[expect(clippy::as_conversions, reason = "Box<GfxPdu> to Box<dyn DvcEncode> coercion")]
     fn cache_import_offer(&mut self) -> Option<DvcMessage> {
+        // The imported tiles live in the compositor, so without it there is nothing to offer them into.
+        if !self.compositor.is_enabled() {
+            return None;
+        }
         let store = self.persistent_cache.as_mut()?;
         // The cache limits depend on the confirmed flags, so without them nothing is offered.
         self.negotiated_caps.as_ref()?;

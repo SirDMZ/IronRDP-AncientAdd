@@ -246,6 +246,20 @@ fn no_offer_from_an_empty_store() {
 }
 
 #[test]
+fn no_offer_and_no_save_without_compositing() {
+    // oracle: mutant a client without compositing offering stored tiles it holds nowhere, or rewriting the store on close
+    let store = MemoryStore::with_entries(vec![solid_entry(30, 8, 8, [1, 2, 3, 255])]);
+    let mut client = GraphicsPipelineClient::new(Box::new(NoopHandler), None)
+        .with_persistent_cache(Box::new(store.clone()))
+        .with_compositing(false);
+
+    assert!(confirm(&mut client, full_cache_caps()).is_empty());
+    client.close(0);
+    assert!(store.state().saved.is_none());
+    assert_eq!(store.state().entries, [solid_entry(30, 8, 8, [1, 2, 3, 255])]);
+}
+
+#[test]
 fn the_offer_follows_the_capabilities_confirm_in_store_order() {
     // oracle: spec MS-RDPEGFX §3.3.5.16 (the offer enumerates the persistent cache) and §2.2.2.16.1
     // (bitmapLength is the entry size in bytes)

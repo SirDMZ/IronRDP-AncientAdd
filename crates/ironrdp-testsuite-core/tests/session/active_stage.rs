@@ -470,6 +470,152 @@ fn active_stage_widens_after_a_reset_and_records_damage() {
     );
 }
 
+// oracle: mutant EGFX output reaching the image passed to ActiveStage::process with compositing off, through a reset or a drawn frame
+#[test]
+fn active_stage_leaves_the_image_untouched_without_egfx_compositing() {
+    use std::borrow::Cow;
+
+    use ironrdp_core::encode_vec;
+    use ironrdp_dvc::DrdynvcClient;
+    use ironrdp_dvc::pdu::{CreateRequestPdu, DataPdu, DrdynvcDataPdu, DrdynvcServerPdu};
+    use ironrdp_egfx::client::{GraphicsPipelineClient, GraphicsPipelineHandler};
+    use ironrdp_egfx::pdu::{
+        Color, CreateSurfacePdu, EndFramePdu, GfxPdu, MapSurfaceToOutputPdu, PixelFormat as GfxPixelFormat,
+        ResetGraphicsPdu, SolidFillPdu, StartFramePdu, Timestamp,
+    };
+    use ironrdp_graphics::zgfx::wrap_uncompressed;
+    use ironrdp_pdu::Action;
+    use ironrdp_pdu::mcs::SendDataIndication;
+    use ironrdp_pdu::rdp::vc::{ChannelControlFlags, ChannelPduHeader};
+    use ironrdp_pdu::x224::X224;
+    use ironrdp_session::{ActiveStageBuilder, ActiveStageOutput};
+    use ironrdp_svc::StaticChannelSet;
+
+    struct Handler;
+    impl GraphicsPipelineHandler for Handler {}
+
+    const DRDYNVC: u16 = 1004;
+    const EGFX: u32 = 7;
+
+    let gfx_client = GraphicsPipelineClient::new(Box::new(Handler), None).with_compositing(false);
+    let mut channels = StaticChannelSet::new();
+    channels.insert(DrdynvcClient::new().with_dynamic_channel(gfx_client));
+    channels.attach_channel_id(core::any::TypeId::of::<DrdynvcClient>(), DRDYNVC);
+    let mut active_stage = ActiveStageBuilder {
+        static_channels: channels,
+        user_channel_id: 1002,
+        io_channel_id: 1003,
+        message_channel_id: None,
+        share_id: 1,
+        compression_type: None,
+        enable_server_pointer: false,
+        pointer_software_rendering: false,
+    }
+    .build();
+
+    // A DRDYNVC PDU as the server sends it: one static channel chunk.
+    let frame = |pdu: &DrdynvcServerPdu| {
+        let pdu = encode_vec(pdu).expect("encode DRDYNVC PDU");
+        let mut data = encode_vec(&ChannelPduHeader {
+            length: u32::try_from(pdu.len()).expect("fits"),
+            flags: ChannelControlFlags::FLAG_FIRST | ChannelControlFlags::FLAG_LAST,
+        })
+        .expect("encode channel header");
+        data.extend_from_slice(&pdu);
+        encode_vec(&X224(SendDataIndication {
+            initiator_id: 1002,
+            channel_id: DRDYNVC,
+            user_data: Cow::Owned(data),
+        }))
+        .expect("encode X224")
+    };
+
+    // The image differs from the reset size, so following the reset would resize it, and the fill lies inside it, so compositing would change its pixels.
+    let mut image = DecodedImage::new(PixelFormat::RgbA32, 32, 16);
+    let untouched = image.data().to_vec();
+
+    active_stage
+        .process(
+            &mut image,
+            Action::X224,
+            &frame(&DrdynvcServerPdu::Create(CreateRequestPdu::new(
+                EGFX,
+                ironrdp_egfx::CHANNEL_NAME.to_owned(),
+            ))),
+            None,
+        )
+        .expect("open the EGFX channel");
+
+    let commands = [
+        GfxPdu::ResetGraphics(ResetGraphicsPdu {
+            width: 64,
+            height: 32,
+            monitors: Vec::new(),
+        }),
+        GfxPdu::CreateSurface(CreateSurfacePdu {
+            surface_id: 1,
+            width: 64,
+            height: 32,
+            pixel_format: GfxPixelFormat::XRgb,
+        }),
+        GfxPdu::MapSurfaceToOutput(MapSurfaceToOutputPdu {
+            surface_id: 1,
+            output_origin_x: 0,
+            output_origin_y: 0,
+        }),
+        GfxPdu::StartFrame(StartFramePdu {
+            timestamp: Timestamp {
+                milliseconds: 0,
+                seconds: 0,
+                minutes: 0,
+                hours: 0,
+            },
+            frame_id: 1,
+        }),
+        GfxPdu::SolidFill(SolidFillPdu {
+            surface_id: 1,
+            fill_pixel: Color {
+                b: 0x30,
+                g: 0x20,
+                r: 0x10,
+                xa: 0xFF,
+            },
+            rectangles: vec![ExclusiveRectangle {
+                left: 4,
+                top: 4,
+                right: 12,
+                bottom: 12,
+            }],
+        }),
+        GfxPdu::EndFrame(EndFramePdu { frame_id: 1 }),
+    ];
+    let mut bytes = Vec::new();
+    for pdu in &commands {
+        bytes.extend(encode_vec(pdu).expect("encode EGFX PDU"));
+    }
+    let outputs = active_stage
+        .process(
+            &mut image,
+            Action::X224,
+            &frame(&DrdynvcServerPdu::Data(DrdynvcDataPdu::Data(DataPdu::new(
+                EGFX,
+                wrap_uncompressed(&bytes),
+            )))),
+            None,
+        )
+        .expect("process the frame");
+
+    assert_eq!((image.width(), image.height()), (32, 16));
+    assert_eq!(image.data(), untouched.as_slice());
+    assert!(
+        !outputs
+            .iter()
+            .any(|output| matches!(output, ActiveStageOutput::GraphicsUpdate(_))),
+        "no graphics update without compositing"
+    );
+    assert!(active_stage.take_damage_regions().is_empty());
+}
+
 /// A surface the server maps to a RemoteApp window is not part of the image:
 /// `composite_graphics_pipeline` hands its pixels back as a window update, once,
 /// so they don't pile up in the pipeline's memory budget.

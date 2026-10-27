@@ -3,6 +3,7 @@ mod avc444;
 mod capabilities;
 mod client;
 mod codecs;
+mod compositing;
 #[cfg(feature = "openh264-bundled")]
 mod decode;
 mod decoded_frame;

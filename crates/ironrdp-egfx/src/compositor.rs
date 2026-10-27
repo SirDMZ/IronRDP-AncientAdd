@@ -233,6 +233,10 @@ pub(crate) struct Compositor {
     small_bitmap_cache: bool,
     /// Window deltas from completed frames, awaiting drain.
     ready_windows: Vec<WindowUpdate>,
+    /// Whether compositing is turned off.
+    ///
+    /// INVARIANT: while disabled, `surfaces` and `cache` stay empty, so every other command finds nothing to act on, nothing is drained, and only buffers reserved with [`Self::reserve_for_surface`] are charged.
+    disabled: bool,
 }
 
 impl Compositor {
@@ -241,8 +245,22 @@ impl Compositor {
         *self = Self {
             output_width: self.output_width,
             output_height: self.output_height,
+            disabled: self.disabled,
             ..Self::default()
         };
+    }
+
+    /// Turn compositing on or off, dropping every surface and cache tile when turning it off.
+    pub(crate) fn set_enabled(&mut self, enabled: bool) {
+        self.disabled = !enabled;
+        if self.disabled {
+            self.reset_protocol();
+        }
+    }
+
+    /// Whether the compositor stores surfaces and produces output.
+    pub(crate) fn is_enabled(&self) -> bool {
+        !self.disabled
     }
 
     pub(crate) fn materializable_output_size(width: u32, height: u32) -> Option<(u16, u16)> {
@@ -347,8 +365,9 @@ impl Compositor {
     /// Refused when the compositor holds no canvas for the surface (it was too large or over budget)
     /// or the reservation would exceed the budget. A reset releases every reservation, so the owner
     /// drops these buffers then; otherwise it returns the bytes with [`Self::release`].
+    /// Without compositing no surface has a canvas, so the budget alone decides.
     pub(crate) fn reserve_for_surface(&mut self, id: u16, len: usize) -> bool {
-        self.surfaces.contains_key(&id) && self.charge(len)
+        (self.disabled || self.surfaces.contains_key(&id)) && self.charge(len)
     }
 
     /// Handle `CreateSurface`: allocate a zeroed RGBA8888 canvas.
@@ -357,7 +376,7 @@ impl Compositor {
     /// allocated; subsequent commands targeting them become no-ops (the metadata
     /// tracked by the client is unaffected).
     pub(crate) fn create_surface(&mut self, id: u16, width: u16, height: u16) {
-        if width == 0 || height == 0 || width > MAX_SURFACE_DIM || height > MAX_SURFACE_DIM {
+        if self.disabled || width == 0 || height == 0 || width > MAX_SURFACE_DIM || height > MAX_SURFACE_DIM {
             return;
         }
         let len = usize::from(width) * usize::from(height) * BYTES_PER_PIXEL;
@@ -656,7 +675,7 @@ impl Compositor {
         height: u16,
         data: Vec<u8>,
     ) -> bool {
-        if width == 0 || height == 0 || pixel_data_len(width, height) != Some(data.len()) {
+        if self.disabled || width == 0 || height == 0 || pixel_data_len(width, height) != Some(data.len()) {
             return false;
         }
 
@@ -2003,6 +2022,57 @@ mod tests {
         // outside the new bounds entirely.
         c.reset(1920, 1080);
         assert!(c.drain_output().is_empty(), "pre-reset deltas must not be drainable");
+        assert_eq!(c.allocated_bytes, 0);
+    }
+
+    // oracle: mutant a disabled compositor allocating a surface canvas, a cache tile or drainable output
+    #[test]
+    fn disabled_compositor_holds_no_pixels() {
+        let mut c = Compositor::default();
+        c.set_enabled(false);
+        c.reset(64, 64);
+        c.create_surface(1, 16, 16);
+        c.map_surface(1, 0, 0);
+        c.apply_bitmap(1, &rect(0, 0, 16, 16), &[0xFF; 16 * 16 * BYTES_PER_PIXEL]);
+        c.solid_fill(
+            1,
+            &Color {
+                r: 0,
+                g: 255,
+                b: 0,
+                xa: 255,
+            },
+            &[rect(0, 0, 8, 8)],
+        );
+        c.surface_to_cache(1, 0, 7, &rect(0, 0, 8, 8));
+        assert!(!c.import_cache_entry(1, 8, 4, 4, vec![0; 4 * 4 * BYTES_PER_PIXEL]));
+        c.cache_to_surface(0, 1, &[Point { x: 0, y: 0 }]);
+        c.end_frame();
+
+        assert_eq!(c.allocated_bytes, 0);
+        assert!(c.drain_output().is_empty());
+        assert!(c.drain_window_updates().is_empty());
+        assert!(c.cache_entries().is_empty());
+    }
+
+    // oracle: mutant a disabled compositor refusing or not charging a codec buffer reserved beside a surface
+    #[test]
+    fn disabled_compositor_still_budgets_reserved_buffers() {
+        let mut c = Compositor::default();
+        c.set_enabled(false);
+        assert!(c.reserve_for_surface(1, 1024));
+        assert_eq!(c.allocated_bytes, 1024);
+        assert!(!c.reserve_for_surface(1, MAX_COMPOSITOR_BYTES));
+    }
+
+    // oracle: mutant a protocol reset turning compositing back on
+    #[test]
+    fn protocol_reset_keeps_compositing_disabled() {
+        let mut c = Compositor::default();
+        c.set_enabled(false);
+        c.reset_protocol();
+        assert!(!c.is_enabled());
+        c.create_surface(1, 16, 16);
         assert_eq!(c.allocated_bytes, 0);
     }
 }

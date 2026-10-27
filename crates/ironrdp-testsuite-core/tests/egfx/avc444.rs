@@ -252,6 +252,77 @@ impl Session {
     }
 }
 
+// oracle: mutant AVC444 pictures refused for want of a compositor canvas when compositing is off
+#[test]
+fn avc444_decodes_without_compositing() {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use ironrdp_egfx::client::BitmapUpdate;
+
+    struct ServerSink;
+    impl ironrdp_egfx::server::GraphicsPipelineHandler for ServerSink {
+        fn capabilities_advertise(&mut self, _pdu: &CapabilitiesAdvertisePdu) {}
+        fn on_ready(&mut self, _negotiated: &CapabilitySet) {}
+    }
+    struct ClientSink(Arc<AtomicUsize>);
+    impl ironrdp_egfx::client::GraphicsPipelineHandler for ClientSink {
+        fn on_bitmap_updated(&mut self, _update: &BitmapUpdate) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    let bitmaps = Arc::new(AtomicUsize::new(0));
+    let mut server = GraphicsPipelineServer::new(Box::new(ServerSink));
+    let mut client =
+        GraphicsPipelineClient::new(Box::new(ClientSink(Arc::clone(&bitmaps))), Some(Box::new(PlaneDecoder)))
+            .with_compositing(false);
+    for advertise in client.start(0).expect("client start") {
+        for confirm in server
+            .process(0, &bytes(&advertise))
+            .expect("server takes the advertisement")
+        {
+            client
+                .process(0, &bytes(&confirm))
+                .expect("client takes the confirmation");
+        }
+    }
+    deliver(&mut server, &mut client);
+    server.set_output_dimensions(WIDTH, HEIGHT);
+    let surface_id = server.create_surface(WIDTH, HEIGHT).expect("surface");
+    assert!(server.map_surface_to_output(surface_id, 0, 0));
+    deliver(&mut server, &mut client);
+
+    let (main, auxiliary) = Yuv444Frame::from_rgba(&checkerboard(0), WIDTH, HEIGHT)
+        .expect("picture")
+        .split(Avc444Layout::V1)
+        .expect("views");
+    let everything = [region(0, WIDTH)];
+    server
+        .try_send_avc444_frame(
+            surface_id,
+            &pack(&main),
+            &everything,
+            Some(&pack(&auxiliary)),
+            Some(&everything),
+            0,
+        )
+        .expect("the server queues the frame");
+    deliver(&mut server, &mut client);
+
+    assert_eq!(client.dropped_updates(), 0);
+    assert_eq!(bitmaps.load(Ordering::Relaxed), 1);
+    assert!(client.drain_output().is_empty());
+
+    fn deliver(server: &mut GraphicsPipelineServer, client: &mut GraphicsPipelineClient) {
+        for message in server.drain_output() {
+            for response in client.process(0, &bytes(&message)).expect("client takes the PDU") {
+                server.process(0, &bytes(&response)).expect("server takes the response");
+            }
+        }
+    }
+}
+
 fn bytes(message: &DvcMessage) -> Vec<u8> {
     encode_vec(message.as_ref()).expect("encode DVC message")
 }
