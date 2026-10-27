@@ -50,6 +50,11 @@ The additions are a portrait of the server they were built for:
   Opus (`sound-opus`), RDP-UDP (`udp`), and Kerberos for gateway authentication need a C
   toolchain and stay out of that build; smart-card CredSSP logon is opt-in (`scard`) for
   the same reason.
+- Applications that embed the crates get two more controls → CredSSP versions below 5,
+  whose key binding CVE-2018-0886 exploited, are refused unless
+  `ClientConnector::with_insecure_credssp(true)` (viewer: `--allow-insecure-credssp`) opts
+  in for a server that cannot be updated; and `GraphicsPipelineClient::with_compositing(false)`
+  turns off the EGFX compositor for an application that draws from the handler callbacks.
 
 The fork tracks upstream `master` by merging it in, and drops its own version of a change
 once upstream covers it.
