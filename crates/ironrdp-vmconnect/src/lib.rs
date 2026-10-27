@@ -167,7 +167,7 @@ where
     debug!("Begin CredSSP (before X.224)");
 
     let mut buf = WriteBuf::new();
-    let (sequence, ts_request) = CredsspSequence::init(
+    let (mut sequence, ts_request) = CredsspSequence::init(
         connector.config.credentials.clone(),
         connector.config.domain.as_deref(),
         PRE_X224_CREDSSP_PROTOCOL,
@@ -175,6 +175,7 @@ where
         server_public_key.to_owned(),
         kerberos_config,
     )?;
+    sequence.set_allow_insecure_versions(connector.allows_insecure_credssp());
     perform_credssp(framed, network_client, &mut buf, sequence, ts_request).await?;
 
     finish_front(framed, connector, &mut buf).await

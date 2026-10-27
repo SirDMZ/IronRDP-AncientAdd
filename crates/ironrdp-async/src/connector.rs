@@ -294,7 +294,7 @@ where
 
     debug!(connector.state = connector.state.name(), "Begin CredSSP");
 
-    let (sequence, ts_request) = CredsspSequence::init(
+    let (mut sequence, ts_request) = CredsspSequence::init(
         connector.config.credentials.clone(),
         connector.config.domain.as_deref(),
         selected_protocol,
@@ -302,6 +302,7 @@ where
         server_public_key,
         kerberos_config,
     )?;
+    sequence.set_allow_insecure_versions(connector.allows_insecure_credssp());
 
     perform_credssp(framed, network_client, buf, sequence, ts_request).await?;
 

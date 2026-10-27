@@ -166,6 +166,7 @@ where
         server_public_key,
         kerberos_config,
     )?;
+    sequence.set_allow_insecure_versions(connector.allows_insecure_credssp());
 
     loop {
         let client_state = {

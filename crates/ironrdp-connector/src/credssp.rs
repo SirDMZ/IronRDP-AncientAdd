@@ -12,7 +12,7 @@ use sspi::Secret;
 use sspi::Username;
 use sspi::credssp::{self, ClientState, CredSspClient};
 use sspi::generator::{Generator, NetworkRequest};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::{
     ConnectorError, ConnectorErrorKind, ConnectorResult, Credentials, ServerName, Written, custom_err, general_err,
@@ -74,11 +74,20 @@ impl PduHint for CredsspEarlyUserAuthResultHint {
 
 pub type CredsspProcessGenerator<'a> = Generator<'a, NetworkRequest, sspi::Result<Vec<u8>>, sspi::Result<ClientState>>;
 
+/// The lowest CredSSP version accepted by default.
+///
+/// With version 4 or lower, the TLS session is bound by encrypting the server's public key, and with version 5 or higher by hashing it with a client nonce ([MS-CSSP] 2.2.1 "TSRequest").
+/// The encrypted-key binding is the scheme the CVE-2018-0886 fix replaced.
+///
+/// [MS-CSSP]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-cssp/6aac4dea-08ef-47a6-8747-22ea7f6d8685
+pub const MIN_SECURE_CREDSSP_VERSION: u32 = 5;
+
 #[derive(Debug)]
 pub struct CredsspSequence {
     client: CredSspClient,
     state: CredsspState,
     selected_protocol: nego::SecurityProtocol,
+    allow_insecure_versions: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -182,11 +191,20 @@ impl CredsspSequence {
             client,
             state: CredsspState::Ongoing,
             selected_protocol: protocol,
+            allow_insecure_versions: false,
         };
 
         let initial_request = credssp::TsRequest::default();
 
         Ok((sequence, initial_request))
+    }
+
+    /// Accept a server that offers a CredSSP version below [`MIN_SECURE_CREDSSP_VERSION`].
+    ///
+    /// Off by default, because those versions bind the server's public key with the scheme CVE-2018-0886 exploited.
+    /// Turn it on only for a server that cannot be updated, on a network where a man-in-the-middle is not a concern.
+    pub fn set_allow_insecure_versions(&mut self, allow: bool) {
+        self.allow_insecure_versions = allow;
     }
 
     /// Returns Some(ts_request) when a TS request is received from server,
@@ -196,6 +214,16 @@ impl CredsspSequence {
             CredsspState::Ongoing => {
                 let message = credssp::TsRequest::from_buffer(input).map_err(|e| custom_err!("TsRequest", e))?;
                 debug!(?message, "Received");
+                // Every server message is checked, so a later one cannot lower the version either.
+                if message.version < MIN_SECURE_CREDSSP_VERSION {
+                    if !self.allow_insecure_versions {
+                        return Err(ConnectorError::new(
+                            "CredSSP",
+                            ConnectorErrorKind::InsecureCredsspVersion(message.version),
+                        ));
+                    }
+                    warn!(version = message.version, "Accepting an insecure CredSSP version");
+                }
                 Ok(Some(message))
             }
             CredsspState::EarlyUserAuthResult => {

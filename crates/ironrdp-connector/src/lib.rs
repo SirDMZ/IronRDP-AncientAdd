@@ -470,6 +470,10 @@ pub enum ConnectorErrorKind {
     General,
     Custom,
     Negotiation(NegotiationFailure),
+    /// The server offered a CredSSP version below 5 and the connector does not accept those.
+    ///
+    /// See [`ClientConnector::with_insecure_credssp`].
+    InsecureCredsspVersion(u32),
 }
 
 impl fmt::Display for ConnectorErrorKind {
@@ -483,6 +487,10 @@ impl fmt::Display for ConnectorErrorKind {
             ConnectorErrorKind::General => write!(f, "general error"),
             ConnectorErrorKind::Custom => write!(f, "custom error"),
             ConnectorErrorKind::Negotiation(failure) => write!(f, "negotiation failure: {failure}"),
+            ConnectorErrorKind::InsecureCredsspVersion(version) => write!(
+                f,
+                "server offered CredSSP version {version}; versions below 5 are refused (CVE-2018-0886)"
+            ),
         }
     }
 }
@@ -498,6 +506,7 @@ impl core::error::Error for ConnectorErrorKind {
             ConnectorErrorKind::Custom => None,
             ConnectorErrorKind::General => None,
             ConnectorErrorKind::Negotiation(failure) => Some(failure),
+            ConnectorErrorKind::InsecureCredsspVersion(_) => None,
         }
     }
 }

@@ -404,6 +404,7 @@ pub struct ClientConnector {
     pub message_channel_id: Option<u16>,
     cluster_data: Option<gcc::ClientClusterData>,
     load_balance_info: Option<String>,
+    allow_insecure_credssp: bool,
     /// X.224 negotiation flags supplied by the server.
     response_flags: nego::ResponseFlags,
     /// Multitransport flags the server advertised in its GCC
@@ -442,6 +443,7 @@ impl ClientConnector {
             message_channel_id: None,
             cluster_data: None,
             load_balance_info: None,
+            allow_insecure_credssp: false,
             response_flags: nego::ResponseFlags::empty(),
             server_multitransport_flags: None,
             auto_reconnect_cookie: None,
@@ -496,6 +498,22 @@ impl ClientConnector {
     pub fn with_load_balance_info(mut self, load_balance_info: String) -> Self {
         self.load_balance_info = Some(load_balance_info);
         self
+    }
+
+    /// Accept a server that offers a CredSSP version below 5.
+    ///
+    /// Off by default: those versions bind the server's public key with the scheme CVE-2018-0886 exploited, and the
+    /// connection fails with [`ConnectorErrorKind::InsecureCredsspVersion`] instead.
+    /// The CredSSP drivers apply it with [`CredsspSequence::set_allow_insecure_versions`](crate::credssp::CredsspSequence::set_allow_insecure_versions).
+    #[must_use]
+    pub fn with_insecure_credssp(mut self, allow: bool) -> Self {
+        self.allow_insecure_credssp = allow;
+        self
+    }
+
+    /// Whether [`with_insecure_credssp`](Self::with_insecure_credssp) accepted CredSSP versions below 5.
+    pub fn allows_insecure_credssp(&self) -> bool {
+        self.allow_insecure_credssp
     }
 
     /// Send the initial X.224 request with an explicit security protocol set.
